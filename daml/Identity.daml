@@ -1,0 +1,140 @@
+module Identity where
+
+import DA.Date
+import DA.Optional (isSome)
+import DA.List (elem, find, map, filter)
+
+-- | Represents the type of a KYC/identity attestation.
+-- This allows for an extensible set of verifiable claims.
+data AttestationType
+  = AML_Clear -- Anti-Money Laundering check passed
+  | PEP_Clear -- Politically Exposed Person check passed
+  | AccreditedInvestor -- Meets criteria for an accredited investor
+  | Sanctions_Clear -- Not on any sanctions lists
+  | VerifiedAddress -- Physical address has been verified
+  deriving (Eq, Show, Ord)
+
+-- | Represents a single verifiable claim made by a provider about an identity owner.
+data Attestation = Attestation
+  { provider : Party
+  , attestationType : AttestationType
+  , validFrom : Date
+  , validUntil : Optional Date
+  , attestationId : Text -- A unique identifier for this attestation from the provider's system
+  , revoked : Bool
+  } deriving (Eq, Show)
+
+-- | A helper function to check if an attestation is currently valid.
+-- It checks that the current date is within the validity period and the attestation is not revoked.
+isAttestationValid : Date -> Attestation -> Bool
+isAttestationValid currentDate att =
+  let
+    isAfterFrom = currentDate >= att.validFrom
+    isBeforeUntil = case att.validUntil of
+      None -> True
+      Some endDate -> currentDate <= endDate
+  in
+    not att.revoked && isAfterFrom && isBeforeUntil
+
+-- | Represents a digital identity for a party on the Canton Network.
+-- This contract is controlled by the owner and can be observed by authorized identity providers.
+-- It serves as a central registry for KYC attestations.
+template Identity
+  with
+    owner : Party
+      -- ^ The party whose identity this contract represents.
+    providers : [Party]
+      -- ^ A list of trusted parties authorized to add attestations to this identity.
+    attestations : [Attestation]
+      -- ^ A list of all attestations, past and present, associated with the owner.
+  where
+    signatory owner
+    observer providers
+
+    key owner : Party
+    maintainer key
+
+    -- | Allows an authorized provider to add a new attestation to the identity.
+    choice AddAttestation : ContractId Identity
+      with
+        attestationType : AttestationType
+        validFrom : Date
+        validUntil : Optional Date
+        attestationId : Text
+      controller p : Party
+      do
+        -- Ensure the controller is an authorized provider.
+        assertMsg (p `elem` providers)
+          ("Party " <> show p <> " is not an authorized provider for this identity.")
+
+        -- Ensure the validity period is logical.
+        assertMsg (case validUntil of None -> True; Some u -> validFrom <= u)
+          ("The 'validFrom' date must be on or before the 'validUntil' date.")
+        
+        -- Ensure the attestation ID is unique for this provider.
+        assertMsg (isNone $ find (\a -> a.provider == p && a.attestationId == attestationId) attestations)
+          ("Attestation ID " <> attestationId <> " is already in use by provider " <> show p <> ".")
+
+        let newAttestation = Attestation with
+              provider = p
+              , attestationType
+              , validFrom
+              , validUntil
+              , attestationId
+              , revoked = False
+
+        create this with
+          attestations = newAttestation :: attestations
+
+    -- | Allows the provider who issued an attestation to revoke it.
+    choice RevokeAttestation : ContractId Identity
+      with
+        attestationIdToRevoke : Text
+      controller p : Party
+      do
+        let
+          -- Find the attestation to revoke and check if the controller is the provider.
+          maybeTargetAttestation = find (\a -> a.attestationId == attestationIdToRevoke && a.provider == p) attestations
+
+        -- Ensure the attestation exists and was issued by the controller.
+        assertMsg (isSome maybeTargetAttestation)
+          ("Attestation with ID " <> attestationIdToRevoke <> " not found or you are not the provider.")
+
+        let
+          -- Function to update the 'revoked' flag of the target attestation.
+          revokeIfTarget att =
+            if att.attestationId == attestationIdToRevoke && att.provider == p then
+              att with revoked = True
+            else
+              att
+          
+          updatedAttestations = map revokeIfTarget attestations
+
+        create this with
+          attestations = updatedAttestations
+
+    -- | Allows the identity owner to authorize a new provider.
+    choice AddProvider : ContractId Identity
+      with
+        newProvider : Party
+      controller owner
+      do
+        -- Ensure the new provider is not already authorized.
+        assertMsg (not $ newProvider `elem` providers)
+          ("Party " <> show newProvider <> " is already an authorized provider.")
+        
+        create this with
+          providers = newProvider :: providers
+
+    -- | Allows the identity owner to de-authorize an existing provider.
+    choice RemoveProvider : ContractId Identity
+      with
+        providerToRemove : Party
+      controller owner
+      do
+        -- Ensure the provider to be removed is in the current list.
+        assertMsg (providerToRemove `elem` providers)
+          ("Party " <> show providerToRemove <> " is not in the list of authorized providers.")
+
+        create this with
+          providers = filter (\p -> p /= providerToRemove) providers
