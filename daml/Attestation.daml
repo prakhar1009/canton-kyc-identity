@@ -1,0 +1,131 @@
+-- | This module defines the core Attestation template, which represents a
+-- | verifiable claim made by a KYC provider about a subject party. It includes
+-- | mechanisms for sharing, revoking, and creating audit receipts for attestations.
+-- |
+-- | The design prioritizes privacy by storing only a hash of the personally
+-- | identifiable information (PII) on the ledger, not the raw data itself.
+module Attestation where
+
+import DA.Time
+import Daml.Script
+
+-- | Represents a verifiable claim made by a KYC Provider about a Subject.
+-- This allows a Subject to selectively disclose attestations to other parties.
+template Attestation
+  with
+    provider : Party
+      -- ^ The entity that issues the attestation (e.g., a bank).
+    subject : Party
+      -- ^ The entity that the attestation is about (e.g., a customer).
+    attestationType : Text
+      -- ^ The type of claim being made (e.g., "IsNaturalPerson", "IsAccreditedInvestor").
+    attestationDataHash : Text
+      -- ^ A cryptographic hash of the underlying PII data.
+    issuedAt : Time
+      -- ^ The timestamp when the attestation was issued.
+    expiresAt : Optional Time
+      -- ^ The timestamp when the attestation expires, if applicable.
+    additionalObservers : [Party]
+      -- ^ Other parties who are allowed to view this attestation, e.g., relying parties.
+  where
+    signatory provider
+    observer subject, additionalObservers
+
+    key (provider, subject, attestationType) : (Party, Party, Text)
+    maintainer key._1
+
+    ensure
+      case expiresAt of
+        None -> True
+        Some expiry -> issuedAt <= expiry
+
+    -- | Helper function to check if the attestation has expired based on the provided time.
+    method isNotExpired: Time -> Bool
+    isNotExpired now =
+      case expiresAt of
+        None -> True
+        Some expiry -> now < expiry
+
+    -- | Allows the Subject to share this attestation with a new party.
+    -- This archives the current attestation and creates a new one with the
+    -- new observer added, preserving the original issuance and expiry dates.
+    choice Share : ContractId Attestation
+      with
+        newObserver : Party
+          -- ^ The party to share this attestation with.
+      controller subject
+      do
+        now <- getTime
+        assertMsg "Cannot share an expired attestation" (isNotExpired now)
+        assertMsg "Party is already an observer" (notElem newObserver (subject :: additionalObservers))
+        assertMsg "Cannot share with the provider" (newObserver /= provider)
+
+        create this with
+          additionalObservers = newObserver :: additionalObservers
+
+    -- | Allows the Provider to revoke the attestation, for example, if the
+    -- underlying information is no longer valid. This archives the contract.
+    choice Revoke : ()
+      with
+        reason : Text
+          -- ^ The reason for revocation, for off-ledger audit purposes.
+      controller provider
+      do
+        -- In a real system, one might create a `RevocationNotification` contract
+        -- for the subject and observers. For simplicity, we just archive.
+        pure ()
+
+    -- | Non-consuming choice for a relying party to verify the attestation
+    -- and check its validity at the current ledger time.
+    nonconsuming choice Verify : ()
+      controller (observers this)
+      do
+        now <- getTime
+        assertMsg "Attestation has expired" (isNotExpired now)
+
+    -- | Allows a relying party (an observer) to create a receipt, acknowledging
+    -- that they have consumed this attestation for a specific purpose. This
+    -- creates an immutable audit trail.
+    choice AcknowledgeConsumption : ContractId AttestationReceipt
+      with
+        purpose : Text
+          -- ^ The business reason for consuming the attestation.
+      controller additionalObservers
+      do
+        now <- getTime
+        assertMsg "Cannot acknowledge an expired attestation" (isNotExpired now)
+
+        create AttestationReceipt with
+          provider = this.provider
+          subject = this.subject
+          consumer = signatory
+          attestationCid = self
+          attestationType = this.attestationType
+          purpose = purpose
+          consumedAt = now
+
+-- | Records the fact that a relying party has consumed an attestation for a
+-- specific business purpose. This creates an audit trail, visible to the
+-- provider, subject, and consumer.
+template AttestationReceipt
+  with
+    provider : Party
+      -- ^ The original attestation provider.
+    subject : Party
+      -- ^ The original attestation subject.
+    consumer : Party
+      -- ^ The party that consumed/relied upon the attestation.
+    attestationCid : ContractId Attestation
+      -- ^ A reference to the attestation that was consumed.
+    attestationType: Text
+      -- ^ The type of the consumed attestation.
+    purpose : Text
+      -- ^ The business reason for consuming the attestation.
+    consumedAt : Time
+      -- ^ The timestamp of consumption.
+  where
+    signatory consumer
+    observer provider, subject
+
+    key (consumer, attestationCid) : (Party, ContractId Attestation)
+    maintainer key._1
