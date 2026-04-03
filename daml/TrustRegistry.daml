@@ -1,0 +1,79 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Kyc.TrustRegistry where
+
+-- | A singleton contract template for managing a trust registry.
+-- This contract acts as a factory for creating TrustedProviderRole proposals.
+-- In a real-world scenario, the creation of this initial registry might be
+-- governed by a consortium or a regulatory body.
+template TrustRegistry
+  with
+    admin : Party -- ^ The sole administrator of this registry.
+  where
+    signatory admin
+
+    -- Ensures that there is only one TrustRegistry per administrator.
+    key admin : Party
+    maintainer key
+
+    choice OfferProviderRole : ContractId TrustedProviderRoleProposal
+      -- ^ The admin can offer a trusted provider role to another party.
+      with
+        provider : Party -- ^ The party to be onboarded as a KYC provider.
+      controller admin
+      do
+        -- Ensure the admin is not trying to add themselves as a provider.
+        assertMsg "Provider cannot be the same as the admin." (admin /= provider)
+
+        create TrustedProviderRoleProposal with
+          admin = admin
+          provider = provider
+
+-- | A proposal for a Party to be designated as a trusted KYC Provider.
+-- This follows the standard proposal/acceptance pattern to ensure mutual consent.
+-- The `provider` must accept this proposal to formalize their role.
+template TrustedProviderRoleProposal
+  with
+    admin    : Party  -- ^ The administrator of the trust registry.
+    provider : Party  -- ^ The party being proposed as a trusted provider.
+  where
+    signatory admin
+    observer provider
+
+    choice AcceptProviderRole : ContractId TrustedProviderRole
+      -- ^ The proposed provider accepts the role, creating the official
+      -- TrustedProviderRole contract.
+      controller provider
+      do
+        create TrustedProviderRole with admin, provider
+
+    choice DeclineProviderRole : ()
+      -- ^ The proposal is declined by the provider or withdrawn by the admin.
+      controller provider, admin
+      do
+        archive self
+
+-- | Represents a trusted KYC provider within a specific registry.
+-- The existence of this contract on the ledger serves as proof that the
+-- 'provider' is authorized by the 'admin' to issue KYC attestations.
+-- Other contracts can query for this contract to verify an attestation's issuer.
+template TrustedProviderRole
+  with
+    admin    : Party  -- ^ The administrator of the trust registry.
+    provider : Party  -- ^ The party designated as a trusted KYC provider.
+  where
+    signatory admin, provider
+
+    -- The key ensures that for a given admin, a party can only be a trusted
+    -- provider once. It also allows other contracts to easily and efficiently
+    -- look up this role using `lookupByKey`.
+    key (admin, provider) : (Party, Party)
+    maintainer key._1
+
+    choice RemoveProvider : ()
+      -- ^ The administrator can revoke the provider's trusted status by
+      -- archiving this contract. This is a critical governance function.
+      controller admin
+      do
+        archive self
