@@ -1,0 +1,41 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Revocation where
+
+import DA.Internal.Template (Template)
+import DA.Time (Time)
+import Attestation (Attestation)
+
+-- | Represents the revocation of a specific KYC/identity attestation.
+-- This contract is created by an identity `provider` to invalidate an `Attestation`
+-- contract they previously issued for a `subject`.
+-- It serves as a permanent, on-ledger record that a specific attestation is no longer valid.
+template Revocation
+  with
+    provider : Party
+      -- ^ The identity provider who issued and is now revoking the attestation.
+    subject : Party
+      -- ^ The party whose attestation is being revoked.
+    attestationCid : ContractId Attestation
+      -- ^ The contract ID of the `Attestation` being revoked.
+    revocationReason : Text
+      -- ^ A clear reason for the revocation (e.g., "Compromised Credentials", "Data Expired").
+    revokedAt : Time
+      -- ^ The timestamp when the revocation was recorded on the ledger.
+
+  where
+    signatory provider
+    observer subject
+
+    key (provider, attestationCid) : (Party, ContractId Attestation)
+    maintainer key._1
+
+    -- | Non-consuming choice for the `subject` to acknowledge they have seen the revocation notice.
+    -- This does not affect the validity of the revocation but can be used for workflow tracking.
+    nonconsuming choice Acknowledge : ()
+      controller subject
+      do
+        pure ()
