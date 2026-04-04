@@ -1,0 +1,213 @@
+module KYCTest where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time (Time, addRelTime, days)
+import DA.Assert
+
+import Attestation
+import Identity
+import Revocation
+import TrustRegistry
+
+-- | A simple contract to simulate a consuming application that needs to verify a subject's identity.
+template AppRequirement
+  with
+    requester : Party
+    subject : Party
+    isVerified : Bool
+  where
+    signatory requester
+    observer subject
+
+    choice VerifyIdentity : ContractId AppRequirement
+      with
+        attestationCid : ContractId Attestation
+        trustRegistryCid : ContractId TrustRegistry
+      controller subject
+      do
+        -- Fetch contracts needed for verification
+        attestation <- fetch attestationCid
+        trustRegistry <- fetch trustRegistryCid
+        now <- getTime
+
+        -- 1. Verify the attestation is for the correct subject
+        assertMsg ("Attestation subject mismatch. Expected " <> show subject <> ", got " <> show attestation.subject)
+          (attestation.subject == subject)
+
+        -- 2. Verify the provider is trusted by the registry
+        assertMsg ("Provider " <> show attestation.provider <> " is not in the trusted list.")
+          (elem attestation.provider trustRegistry.trustedProviders)
+
+        -- 3. Verify the attestation has not expired
+        assertMsg ("Attestation expired on " <> show attestation.expiryDate)
+          (now < attestation.expiryDate)
+
+        -- 4. Verify the attestation has not been revoked
+        -- A revocation is marked by the existence of a RevocationLock contract.
+        revocationQuery <- query @RevocationLock with provider = attestation.provider, attestationCid
+        assertMsg "Attestation has been revoked." (null revocationQuery)
+
+        -- If all checks pass, update the requirement status
+        create this with isVerified = True
+      
+    choice ResetVerification : ContractId AppRequirement
+      controller requester
+      do
+        create this with isVerified = False
+
+
+-- | Main test suite that orchestrates all KYC tests.
+kycTestSuite : Script ()
+kycTestSuite = script do
+  -- Allocate parties for different roles in the ecosystem
+  registryAdmin <- allocateParty "RegistryAdmin"
+  identityProvider <- allocateParty "IdentityProvider"
+  untrustedProvider <- allocateParty "UntrustedProvider"
+  subject <- allocateParty "Subject"
+  consumingApp <- allocateParty "ConsumingApp"
+
+  -- Run test scenarios
+  testFullKycFlow registryAdmin identityProvider subject consumingApp
+  testExpiredAttestation registryAdmin identityProvider subject consumingApp
+  testRevokedAttestation registryAdmin identityProvider subject consumingApp
+  testUntrustedProvider registryAdmin untrustedProvider subject consumingApp
+  
+-- | Test Case 1: A successful end-to-end KYC flow.
+testFullKycFlow : Party -> Party -> Party -> Party -> Script ()
+testFullKycFlow registryAdmin identityProvider subject consumingApp = script do
+  debug "--- Running Test: Full Successful KYC Flow ---"
+
+  -- 1. Registry Admin sets up the trust registry
+  debug "Step 1: Admin creates the Trust Registry"
+  trustRegistryCid <- submit registryAdmin do
+    create TrustRegistry with admin = registryAdmin, trustedProviders = []
+
+  -- 2. Admin adds a trusted identity provider to the registry
+  debug "Step 2: Admin adds the Identity Provider to the Trust Registry"
+  submit registryAdmin do
+    exercise trustRegistryCid AddProvider with providerToAdd = identityProvider
+
+  -- 3. The subject creates their own identity contract
+  debug "Step 3: Subject creates their Identity contract"
+  identityCid <- submit subject do
+    create SubjectIdentity with owner = subject, observers = [identityProvider]
+
+  -- 4. The trusted provider proposes an attestation to the subject
+  debug "Step 4: Identity Provider proposes an attestation"
+  now <- getTime
+  let validExpiry = addRelTime now (days 365)
+  proposalCid <- submit identityProvider do
+    create AttestationProposal with
+      provider = identityProvider
+      subject
+      identityCid
+      attestationData = "Standard KYC Level"
+      expiryDate = validExpiry
+
+  -- 5. The subject accepts the attestation
+  debug "Step 5: Subject accepts the attestation"
+  attestationCid <- submit subject do
+    exercise proposalCid AcceptAttestation
+
+  -- 6. A consuming application requires identity verification
+  debug "Step 6: Consuming App creates a requirement for the Subject"
+  appRequirementCid <- submit consumingApp do
+    create AppRequirement with requester = consumingApp, subject, isVerified = False
+
+  -- 7. The subject presents their attestation to the consuming app for verification
+  debug "Step 7: Subject presents the attestation to satisfy the requirement"
+  verifiedRequirementCid <- submit subject do
+    exercise appRequirementCid VerifyIdentity with attestationCid, trustRegistryCid
+
+  -- 8. Assert that the verification was successful
+  verifiedRequirement <- fetch verifiedRequirementCid
+  assertMsg "App requirement should be marked as verified" verifiedRequirement.isVerified
+  debug "--- Test Successful: Full KYC Flow Completed ---"
+
+
+-- | Test Case 2: Verification fails because the attestation is expired.
+testExpiredAttestation : Party -> Party -> Party -> Party -> Script ()
+testExpiredAttestation registryAdmin identityProvider subject consumingApp = script do
+  debug "--- Running Test: Expired Attestation ---"
+  
+  -- Setup: Create registry, add provider, create identity and attestation
+  trustRegistryCid <- submit registryAdmin do create TrustRegistry with admin = registryAdmin, trustedProviders = [identityProvider]
+  identityCid <- submit subject do create SubjectIdentity with owner = subject, observers = [identityProvider]
+  now <- getTime
+  let pastExpiry = addRelTime now (days (-1)) -- Set expiry to yesterday
+  proposalCid <- submit identityProvider do
+    create AttestationProposal with provider = identityProvider, subject, identityCid, attestationData = "Expired KYC", expiryDate = pastExpiry
+  attestationCid <- submit subject do exercise proposalCid AcceptAttestation
+
+  -- Create the verification requirement
+  appRequirementCid <- submit consumingApp do
+    create AppRequirement with requester = consumingApp, subject, isVerified = False
+
+  -- Attempt verification, which is expected to fail
+  debug "Attempting to verify with an expired attestation..."
+  submitMustFail subject do
+    exercise appRequirementCid VerifyIdentity with attestationCid, trustRegistryCid
+
+  debug "--- Test Successful: Verification correctly failed for expired attestation ---"
+
+
+-- | Test Case 3: Verification fails because the attestation has been revoked.
+testRevokedAttestation : Party -> Party -> Party -> Party -> Script ()
+testRevokedAttestation registryAdmin identityProvider subject consumingApp = script do
+  debug "--- Running Test: Revoked Attestation ---"
+
+  -- Setup: Create a valid attestation
+  trustRegistryCid <- submit registryAdmin do create TrustRegistry with admin = registryAdmin, trustedProviders = [identityProvider]
+  identityCid <- submit subject do create SubjectIdentity with owner = subject, observers = [identityProvider]
+  now <- getTime
+  let validExpiry = addRelTime now (days 365)
+  proposalCid <- submit identityProvider do
+    create AttestationProposal with provider = identityProvider, subject, identityCid, attestationData = "Standard KYC", expiryDate = validExpiry
+  attestationCid <- submit subject do exercise proposalCid AcceptAttestation
+
+  -- The provider revokes the attestation
+  debug "Identity Provider revokes the attestation"
+  submit identityProvider do
+    exercise attestationCid Revoke with reason = "Subject reported fraudulent activity."
+
+  -- Create the verification requirement
+  appRequirementCid <- submit consumingApp do
+    create AppRequirement with requester = consumingApp, subject, isVerified = False
+
+  -- Attempt verification, which is expected to fail due to revocation
+  debug "Attempting to verify with a revoked attestation..."
+  submitMustFail subject do
+    exercise appRequirementCid VerifyIdentity with attestationCid, trustRegistryCid
+
+  debug "--- Test Successful: Verification correctly failed for revoked attestation ---"
+
+
+-- | Test Case 4: Verification fails because the attestation provider is not in the trust registry.
+testUntrustedProvider : Party -> Party -> Party -> Party -> Script ()
+testUntrustedProvider registryAdmin untrustedProvider subject consumingApp = script do
+  debug "--- Running Test: Untrusted Provider ---"
+
+  -- Setup: Create registry, but DO NOT add the provider
+  trustRegistryCid <- submit registryAdmin do
+    create TrustRegistry with admin = registryAdmin, trustedProviders = []
+  debug "Trust Registry created, but provider is not added."
+
+  -- Untrusted provider issues an attestation
+  identityCid <- submit subject do create SubjectIdentity with owner = subject, observers = [untrustedProvider]
+  now <- getTime
+  let validExpiry = addRelTime now (days 365)
+  proposalCid <- submit untrustedProvider do
+    create AttestationProposal with provider = untrustedProvider, subject, identityCid, attestationData = "Data from untrusted source", expiryDate = validExpiry
+  attestationCid <- submit subject do exercise proposalCid AcceptAttestation
+
+  -- Create the verification requirement
+  appRequirementCid <- submit consumingApp do
+    create AppRequirement with requester = consumingApp, subject, isVerified = False
+  
+  -- Attempt verification, which is expected to fail
+  debug "Attempting to verify with an attestation from an untrusted provider..."
+  submitMustFail subject do
+    exercise appRequirementCid VerifyIdentity with attestationCid, trustRegistryCid
+
+  debug "--- Test Successful: Verification correctly failed for untrusted provider ---"
