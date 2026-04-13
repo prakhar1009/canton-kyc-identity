@@ -1,0 +1,209 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Kyc.MultiAttestation where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time (Time, getTime)
+import DA.Assert
+import DA.List (delete, elem)
+import Kyc.Attestation (Attestation(..), KycLevel(..))
+
+-- | A data type to encapsulate the result of a trust score calculation.
+data TrustScoreResult = TrustScoreResult
+  with
+    score : Int
+      -- ^ The calculated numeric trust score.
+    attestationsUsed : Int
+      -- ^ The number of valid attestations used in the calculation.
+    attestationsExpiredOrInvalid : Int
+      -- ^ The number of attestations that were skipped (expired, or for wrong subject).
+  deriving (Eq, Show)
+
+-- | A contract that aggregates multiple KYC attestations for a single subject.
+-- This allows a party (the requester) to build a composite identity profile for a subject
+-- and calculate a trust score based on the combined attestations from various providers.
+template MultiAttestation
+  with
+    subject: Party
+      -- ^ The party whose identity is being attested.
+    requester: Party
+      -- ^ The party who created this aggregated view of the subject's identity.
+    attestationCids: [ContractId Attestation]
+      -- ^ A list of individual KYC attestations for the subject.
+    observers: [Party]
+      -- ^ Parties who can view this aggregated attestation.
+  where
+    signatory subject, requester
+    observer observers
+
+    key (subject, requester) : (Party, Party)
+    maintainer key._2
+
+    -- | Calculates a composite trust score based on the current set of attestations.
+    -- This choice fetches each attestation, checks if it's still valid (not expired
+    -- and for the correct subject), and sums up a score based on the KYC level.
+    nonconsuming choice CalculateTrustScore: TrustScoreResult
+      with
+        viewer: Party
+          -- ^ The party requesting the score calculation.
+      controller viewer
+      do
+        assertMsg "Viewer must be a stakeholder to calculate the score."
+          (elem viewer (signatory this ++ observer this))
+
+        currentTime <- getTime
+
+        -- Helper function to process a single attestation contract.
+        let processAttestation (cid: ContractId Attestation) (acc: (Int, Int, Int)) : Update (Int, Int, Int) = do
+              let (currentScore, usedCount, invalidCount) = acc
+              attestation <- fetch cid
+              -- Attestation is valid if it's for the correct subject and not expired.
+              if attestation.subject == this.subject && currentTime <= attestation.expiryTime
+                then do
+                  let levelScore = case attestation.level of
+                        Level1 -> 10
+                        Level2 -> 25
+                        Level3 -> 50
+                  return (currentScore + levelScore, usedCount + 1, invalidCount)
+                else
+                  return (currentScore, usedCount, invalidCount + 1)
+
+        -- Fold over the list of CIDs, processing each one to calculate the final score.
+        (finalScore, finalUsed, finalInvalid) <- foldlA processAttestation (0, 0, 0) attestationCids
+
+        return TrustScoreResult with
+          score = finalScore
+          attestationsUsed = finalUsed
+          attestationsExpiredOrInvalid = finalInvalid
+
+    -- | Adds a new attestation to the list for score calculation.
+    choice AddAttestation : ContractId MultiAttestation
+      with
+        newAttestationCid : ContractId Attestation
+      controller requester
+      do
+        -- Validate the new attestation before adding it.
+        newAttestation <- fetch newAttestationCid
+        assertMsg "New attestation must be for the correct subject." (newAttestation.subject == this.subject)
+        assertMsg "Attestation is already included in this aggregate." (not (elem newAttestationCid this.attestationCids))
+
+        create this with
+          attestationCids = newAttestationCid :: this.attestationCids
+
+    -- | Removes an attestation from the list, e.g., if it is revoked or known to be outdated.
+    choice RemoveAttestation : ContractId MultiAttestation
+      with
+        attestationCidToRemove : ContractId Attestation
+      controller requester
+      do
+        assertMsg "Attestation to be removed was not found in the list." (elem attestationCidToRemove this.attestationCids)
+        create this with
+          attestationCids = delete attestationCidToRemove this.attestationCids
+
+    -- | Grants observer access to another party, allowing them to view the aggregate and calculate the score.
+    choice ShareWith : ContractId MultiAttestation
+      with
+        newObserver : Party
+      controller subject, requester
+      do
+        assertMsg "The specified party is already an observer." (not (elem newObserver this.observers))
+        create this with
+          observers = newObserver :: this.observers
+
+-- | Test suite for the MultiAttestation template.
+multiAttestationTest: Script ()
+multiAttestationTest = script do
+  -- 1. Setup Parties
+  provider1 <- allocatePartyWithHint "Provider1" (PartyIdHint "Provider1")
+  provider2 <- allocatePartyWithHint "Provider2" (PartyIdHint "Provider2")
+  subject <- allocatePartyWithHint "Subject" (PartyIdHint "Subject")
+  requester <- allocatePartyWithHint "Requester" (PartyIdHint "Requester")
+  observer1 <- allocatePartyWithHint "Observer1" (PartyIdHint "Observer1")
+  maliciousParty <- allocatePartyWithHint "Malicious" (PartyIdHint "Malicious")
+
+  -- 2. Setup Time and prerequisite Attestation contracts
+  now <- getTime
+  let expiryIn30Days = addRelTime now (30.0 * 24.0 * 60.0 * 60.0)
+  let expiryYesterday = addRelTime now (-1.0 * 24.0 * 60.0 * 60.0)
+
+  attestation1Cid <- submit provider1 do
+    create Attestation with provider = provider1, subject = subject, level = Level1, attestationId = "P1-S-L1", attestationDataHash = "hash1", expiryTime = expiryIn30Days
+  attestation2Cid <- submit provider2 do
+    create Attestation with provider = provider2, subject = subject, level = Level3, attestationId = "P2-S-L3", attestationDataHash = "hash2", expiryTime = expiryIn30Days
+  expiredAttestationCid <- submit provider1 do
+    create Attestation with provider = provider1, subject = subject, level = Level2, attestationId = "P1-S-L2-EXP", attestationDataHash = "hash3", expiryTime = expiryYesterday
+  wrongSubjectAttestationCid <- submit provider2 do
+    create Attestation with provider = provider2, subject = maliciousParty, level = Level3, attestationId = "P2-M-L3", attestationDataHash = "hash4", expiryTime = expiryIn30Days
+
+  -- 3. Create MultiAttestation contract
+  -- In a real scenario, this would likely be a proposal/accept flow between the subject and requester.
+  -- For a test script, submitMulti is sufficient.
+  multiCid <- submitMulti [requester, subject] [] do
+    create MultiAttestation with
+      subject = subject
+      requester = requester
+      attestationCids = [attestation1Cid, attestation2Cid, expiredAttestationCid]
+      observers = [observer1]
+
+  -- 4. Test CalculateTrustScore
+  debug "--- Testing Trust Score Calculation ---"
+  -- Expected score: Level1 (10) + Level3 (50) = 60. Expired Level2 is ignored.
+  let expectedInitialResult = TrustScoreResult with score = 60, attestationsUsed = 2, attestationsExpiredOrInvalid = 1
+  -- Requester calculates score
+  result1 <- submit requester do exercise multiCid CalculateTrustScore with viewer = requester
+  result1 === expectedInitialResult
+  debug $ "Initial score calculation by requester: " <> show result1
+  -- Subject calculates score
+  result2 <- submit subject do exercise multiCid CalculateTrustScore with viewer = subject
+  result2 === expectedInitialResult
+  -- Observer calculates score
+  result3 <- submit observer1 do exercise multiCid CalculateTrustScore with viewer = observer1
+  result3 === expectedInitialResult
+  -- Malicious party fails to calculate score
+  submitMustFail maliciousParty do exercise multiCid CalculateTrustScore with viewer = maliciousParty
+
+  -- 5. Test AddAttestation
+  debug "\n--- Testing AddAttestation ---"
+  newAttestationCid <- submit provider1 do
+    create Attestation with provider = provider1, subject = subject, level = Level2, attestationId = "P1-S-L2", attestationDataHash = "hash5", expiryTime = expiryIn30Days
+  multiCid2 <- submit requester do exercise multiCid AddAttestation with newAttestationCid
+  -- Calculate score again. Expected score: 60 + Level2 (25) = 85
+  let expectedResultAfterAdd = TrustScoreResult with score = 85, attestationsUsed = 3, attestationsExpiredOrInvalid = 1
+  result4 <- submit requester do exercise multiCid2 CalculateTrustScore with viewer = requester
+  result4 === expectedResultAfterAdd
+  debug $ "Score after adding attestation: " <> show result4
+  -- Try to add an attestation for the wrong subject (must fail)
+  submitMustFail requester do exercise multiCid2 AddAttestation with newAttestationCid = wrongSubjectAttestationCid
+  -- Try to add a duplicate attestation (must fail)
+  submitMustFail requester do exercise multiCid2 AddAttestation with newAttestationCid
+
+  -- 6. Test RemoveAttestation
+  debug "\n--- Testing RemoveAttestation ---"
+  multiCid3 <- submit requester do exercise multiCid2 RemoveAttestation with attestationCidToRemove = attestation1Cid
+  -- Calculate score again. Expected score: 85 - Level1 (10) = 75
+  let expectedResultAfterRemove = TrustScoreResult with score = 75, attestationsUsed = 2, attestationsExpiredOrInvalid = 1
+  result5 <- submit requester do exercise multiCid3 CalculateTrustScore with viewer = requester
+  result5 === expectedResultAfterRemove
+  debug $ "Score after removing attestation: " <> show result5
+
+  -- 7. Test ShareWith
+  debug "\n--- Testing ShareWith ---"
+  newObserver <- allocatePartyWithHint "NewObserver" (PartyIdHint "NewObserver")
+  -- Subject shares with a new observer
+  multiCid4 <- submit subject do exercise multiCid3 ShareWith with newObserver
+  -- New observer can now calculate the score
+  result6 <- submit newObserver do exercise multiCid4 CalculateTrustScore with viewer = newObserver
+  result6 === expectedResultAfterRemove
+  debug $ "Score calculation by new observer (shared by subject): " <> show result6
+  -- Requester can also share
+  newObserver2 <- allocatePartyWithHint "NewObserver2" (PartyIdHint "NewObserver2")
+  multiCid5 <- submit requester do exercise multiCid4 ShareWith with newObserver = newObserver2
+  result7 <- submit newObserver2 do exercise multiCid5 CalculateTrustScore with viewer = newObserver2
+  result7 === expectedResultAfterRemove
+  debug $ "Score calculation by second new observer (shared by requester): " <> show result7
+  -- Malicious party cannot share
+  submitMustFail maliciousParty do exercise multiCid5 ShareWith with newObserver = maliciousParty
+
+  debug "\nMultiAttestation tests passed successfully."
