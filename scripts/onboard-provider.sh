@@ -1,118 +1,203 @@
 #!/bin/bash
-# ------------------------------------------------------------------------------------------------
-# Description:
-#   Onboards a new KYC identity provider onto the Canton network.
+# -----------------------------------------------------------------------------
+# Onboard a new KYC Provider to the Canton network.
 #
-#   This script performs two main actions:
-#   1. Allocates a new party for the provider on a specified Canton participant node.
-#   2. Runs a Daml script to create a `TrustedProvider` contract on the ledger,
-#      officially registering the new provider's party in the Trust Registry.
-#
-# Usage:
-#   ./scripts/onboard-provider.sh <PROVIDER_DISPLAY_NAME> <PARTICIPANT_ID>
-#
-# Example:
-#   ./scripts/onboard-provider.sh "Global KYC Corp" participant2
+# This script performs the following actions:
+# 1. Allocates a new party for the KYC provider on a specified participant node.
+# 2. Determines the main package ID from the project's compiled DAR file.
+# 3. Creates a `Kyc.Identity.Provider` contract on the ledger, associating the
+#    new party with the provider's metadata.
 #
 # Prerequisites:
-#   - A running Canton network.
-#   - Daml SDK (v3.1.0 or compatible) installed and `daml` in the PATH.
-#   - A compiled DAR file at `.daml/dist/canton-kyc-identity-0.1.0.dar`.
-#   - An environment file `.env` at the project root with `REGISTRAR_PARTY`, `LEDGER_HOST`,
-#     `LEDGER_PORT`, and `CANTON_DIR` configured.
-# ------------------------------------------------------------------------------------------------
+# - curl: for making HTTP requests to the Canton JSON API.
+# - jq: for parsing JSON responses from the API.
+# - dpm: for inspecting the DAR file to get the package ID.
+#
+# Usage:
+#   scripts/onboard-provider.sh \
+#     --provider-name "VeriSure Inc." \
+#     --description "Global leader in identity verification."
+#
+# Options:
+#   --provider-name <name>      (Required) The legal name of the KYC provider.
+#   --description <desc>        (Required) A short description of the provider.
+#   --participant-url <url>     URL of the Canton participant's JSON API.
+#                               (Default: http://localhost:7575)
+#   --dar-path <path>           Path to the compiled project DAR file.
+#                               (Default: .daml/dist/canton-kyc-identity-0.1.0.dar)
+#   --jwt <token>               Authentication JWT. Can also be set via the
+#                               CANTON_JWT environment variable.
+#   -h, --help                  Show this help message.
+# -----------------------------------------------------------------------------
 
 set -euo pipefail
 
-# --- Configuration ---
-# Load from .env file at the project root if it exists
-if [ -f "$(dirname "$0")/../.env" ]; then
-  source "$(dirname "$0")/../.env"
+# --- Configuration and Defaults ---
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULT_PARTICIPANT_URL="http://localhost:7575"
+DEFAULT_DAR_PATH="$PROJECT_ROOT/.daml/dist/canton-kyc-identity-0.1.0.dar"
+PROVIDER_NAME=""
+DESCRIPTION=""
+JWT="${CANTON_JWT:-}"
+
+# --- Helper Functions ---
+function usage() {
+  echo "Usage: $0 --provider-name <name> --description <desc> [options]"
+  echo ""
+  echo "Onboards a new KYC provider."
+  echo ""
+  echo "Options:"
+  echo "  --provider-name <name>      (Required) The legal name of the KYC provider."
+  echo "  --description <desc>        (Required) A short description of the provider."
+  echo "  --participant-url <url>     Canton participant JSON API URL. (Default: $DEFAULT_PARTICIPANT_URL)"
+  echo "  --dar-path <path>           Path to the compiled DAR file. (Default: $DEFAULT_DAR_PATH)"
+  echo "  --jwt <token>               Authentication JWT. Can also be set via CANTON_JWT."
+  echo "  -h, --help                  Show this help message."
+  exit 1
+}
+
+function check_deps() {
+  local missing_deps=0
+  for dep in curl jq dpm; do
+    if ! command -v "$dep" &> /dev/null; then
+      echo "Error: Required command '$dep' is not installed or not in your PATH."
+      missing_deps=1
+    fi
+  done
+  if [ $missing_deps -eq 1 ]; then
+    exit 1
+  fi
+}
+
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --provider-name)
+      PROVIDER_NAME="$2"
+      shift 2
+      ;;
+    --description)
+      DESCRIPTION="$2"
+      shift 2
+      ;;
+    --participant-url)
+      PARTICIPANT_URL="$2"
+      shift 2
+      ;;
+    --dar-path)
+      DAR_PATH="$2"
+      shift 2
+      ;;
+    --jwt)
+      JWT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      ;;
+  esac
+done
+
+# --- Validation ---
+if [[ -z "$PROVIDER_NAME" || -z "$DESCRIPTION" ]]; then
+  echo "Error: --provider-name and --description are required."
+  usage
 fi
-
-# Set defaults and check for required environment variables
-LEDGER_HOST=${LEDGER_HOST:-"localhost"}
-LEDGER_PORT=${LEDGER_PORT:-6865}
-REGISTRAR_PARTY=${REGISTRAR_PARTY:?"ERROR: REGISTRAR_PARTY must be set in your .env file."}
-DAR_FILE=${DAR_FILE:-".daml/dist/canton-kyc-identity-0.1.0.dar"}
-CANTON_DIR=${CANTON_DIR:?"ERROR: CANTON_DIR (path to Canton installation) must be set in your .env file."}
-CANTON_CONFIG_FILE=${CANTON_CONFIG_FILE:-"${CANTON_DIR}/participant.conf"}
-
-# --- Argument Validation ---
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <PROVIDER_DISPLAY_NAME> <PARTICIPANT_ID>"
-    echo "  <PROVIDER_DISPLAY_NAME>: The human-readable name for the provider (e.g., \"Global KYC Corp\")."
-    echo "  <PARTICIPANT_ID>: The ID of the Canton participant node to host the provider (e.g., participant1)."
+if [[ -z "$JWT" ]]; then
+  echo "Error: Authentication JWT must be provided via --jwt option or CANTON_JWT environment variable."
+  usage
+fi
+if [[ ! -f "$DAR_PATH" ]]; then
+    echo "Error: DAR file not found at '$DAR_PATH'. Please build the project with 'dpm build'."
     exit 1
 fi
 
-PROVIDER_NAME=$1
-PARTICIPANT_ID=$2
+check_deps
+PARTICIPANT_URL="${PARTICIPANT_URL:-$DEFAULT_PARTICIPANT_URL}"
+DAR_PATH="${DAR_PATH:-$DEFAULT_DAR_PATH}"
 
-echo "🚀 Onboarding KYC Provider: '$PROVIDER_NAME' on participant '$PARTICIPANT_ID'..."
+# --- Main Execution ---
+echo "▶️  Starting KYC Provider Onboarding..."
+echo "  Provider Name:     $PROVIDER_NAME"
+echo "  Participant URL:   $PARTICIPANT_URL"
+echo "  DAR Path:          $DAR_PATH"
+echo ""
 
-# --- Step 1: Allocate a new Party for the Provider ---
-echo "--> Step 1: Allocating new party on participant '$PARTICIPANT_ID'..."
+# 1. Allocate Party
+echo "1. Allocating party for '$PROVIDER_NAME'..."
+PARTY_ALLOC_PAYLOAD=$(jq -n --arg name "$PROVIDER_NAME" '{"displayName": $name}')
+PARTY_RESPONSE=$(curl -s -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  --data "$PARTY_ALLOC_PAYLOAD" \
+  "$PARTICIPANT_URL/v2/parties/allocate")
 
-# Generate a unique party hint from the display name.
-# Slugify the name and add a short random suffix for uniqueness.
-PROVIDER_HINT=$(echo "$PROVIDER_NAME" | tr '[:upper:]' '[:lower:]' | tr -s ' ' '-' | sed 's/[^a-z0-9-]//g')
-RANDOM_SUFFIX=$(head /dev/urandom | tr -dc a-z0-9 | head -c 4)
-PARTY_HINT="${PROVIDER_HINT}-${RANDOM_SUFFIX}"
+PROVIDER_PARTY_ID=$(echo "$PARTY_RESPONSE" | jq -r '.identifier')
+if [[ -z "$PROVIDER_PARTY_ID" || "$PROVIDER_PARTY_ID" == "null" ]]; then
+  echo "Error: Failed to allocate party."
+  echo "Response: $PARTY_RESPONSE"
+  exit 1
+fi
+echo "   ✅ Success! Party ID: $PROVIDER_PARTY_ID"
+echo ""
 
-echo "   Generated Party Hint: ${PARTY_HINT}"
-
-# Canton console command to enable the party.
-# This command doesn't return the party ID in a script-friendly way, so we list parties afterwards.
-CANTON_ENABLE_CMD="${PARTICIPANT_ID}.parties.enable(\"${PARTY_HINT}\")"
-$CANTON_DIR/bin/canton -c $CANTON_CONFIG_FILE --no-tty --console-command "$CANTON_ENABLE_CMD" > /dev/null
-
-# Now, list parties with the specific hint to get the full Party ID.
-CANTON_LIST_CMD="${PARTICIPANT_ID}.parties.list(limit = 1, filter_hint = \"${PARTY_HINT}\")"
-PARTY_LIST_OUTPUT=$($CANTON_DIR/bin/canton -c $CANTON_CONFIG_FILE --no-tty --console-command "$CANTON_LIST_CMD")
-
-# Extract the full Party ID from the list output. It's usually in quotes.
-# Example: Vector(KnownParty(party(party_id(unique_id(fingerprint...)), "provider-xyz-a1b2::...") ,...))
-PROVIDER_PARTY=$(echo "$PARTY_LIST_OUTPUT" | grep -oP '"'${PARTY_HINT}'::[^"]+"' | tr -d '"')
-
-if [ -z "$PROVIDER_PARTY" ]; then
-    echo "❌ ERROR: Failed to allocate or find party with hint '${PARTY_HINT}'."
-    echo "   Please check your Canton logs and configuration."
-    echo "   Canton 'parties.list' command output:"
-    echo "$PARTY_LIST_OUTPUT"
+# 2. Get Package ID from DAR
+echo "2. Inspecting DAR to find package ID..."
+PACKAGE_ID=$(dpm damlc inspect-dar --json "$DAR_PATH" | jq -r .main_package_id)
+if [[ -z "$PACKAGE_ID" ]]; then
+    echo "Error: Failed to extract package ID from '$DAR_PATH'."
     exit 1
 fi
-
-echo "✅ Party allocated successfully. Party ID: ${PROVIDER_PARTY}"
-
-# --- Step 2: Register the Provider on the Ledger via Daml Script ---
-echo "--> Step 2: Creating 'TrustedProvider' contract on the ledger..."
-
-# We execute a Daml script to create the TrustRegistry.TrustedProvider contract.
-# The script is expected to be named `TrustRegistry.Scripts:registerProvider`.
-# It requires the REGISTRAR_PARTY to act as the controller and the new PROVIDER_PARTY as data.
-# We pass them as named parties to the script, which the script can access via `getParty`.
-SCRIPT_NAME="TrustRegistry.Scripts:registerProvider"
-
-daml script \
-  --dar "${DAR_FILE}" \
-  --script-name "${SCRIPT_NAME}" \
-  --ledger-host "${LEDGER_HOST}" \
-  --ledger-port "${LEDGER_PORT}" \
-  --party "Registrar=${REGISTRAR_PARTY}" \
-  --party "Provider=${PROVIDER_PARTY}"
-
-echo "✅ Provider registered on the ledger."
-
-# --- Final Summary ---
+echo "   ✅ Success! Package ID: $PACKAGE_ID"
 echo ""
-echo "========================================="
-echo "  KYC Provider Onboarding Complete"
-echo "========================================="
-echo "  Display Name: ${PROVIDER_NAME}"
-echo "  Participant:  ${PARTICIPANT_ID}"
-echo "  Party ID:     ${PROVIDER_PARTY}"
-echo "========================================="
+
+# 3. Create Provider Contract
+echo "3. Creating Kyc.Identity.Provider contract on the ledger..."
+PROVIDER_TEMPLATE_ID="${PACKAGE_ID}:Kyc.Identity.Provider"
+CREATE_PAYLOAD=$(jq -n \
+  --arg tpid "$PROVIDER_TEMPLATE_ID" \
+  --arg party "$PROVIDER_PARTY_ID" \
+  --arg name "$PROVIDER_NAME" \
+  --arg desc "$DESCRIPTION" \
+'{
+  "templateId": $tpid,
+  "payload": {
+    "providerParty": $party,
+    "name": $name,
+    "description": $desc,
+    "observers": []
+  }
+}')
+
+CREATE_RESPONSE=$(curl -s -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  --data "$CREATE_PAYLOAD" \
+  "$PARTICIPANT_URL/v1/create")
+
+CONTRACT_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.contractId')
+STATUS_CODE=$(echo "$CREATE_RESPONSE" | jq -r '.status')
+
+if [[ "$STATUS_CODE" != "200" || -z "$CONTRACT_ID" || "$CONTRACT_ID" == "null" ]]; then
+  echo "Error: Failed to create Provider contract."
+  echo "Response: $CREATE_RESPONSE"
+  exit 1
+fi
+echo "   ✅ Success! Provider Contract ID: $CONTRACT_ID"
 echo ""
-echo "The new provider is now active and can issue attestations."
+
+# --- Final Output ---
+echo "🎉 Onboarding Complete!"
+echo "----------------------------------------"
+echo "  Provider Name:     $PROVIDER_NAME"
+echo "  Party ID:          $PROVIDER_PARTY_ID"
+echo "  Provider CId:      $CONTRACT_ID"
+echo "----------------------------------------"
+echo "This provider can now start issuing attestations."
 echo ""
+exit 0
