@@ -1,79 +1,105 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates.
+-- All rights reserved.
+--
+-- This module defines a trust registry for KYC (Know Your Customer) providers.
+-- It allows a designated authority to maintain a list of trusted identity
+-- providers, which can then be queried by other parties on the network to
+-- verify the legitimacy of a KYC attestation.
+--
 
-module Kyc.TrustRegistry where
+module KYC.TrustRegistry where
 
--- | A singleton contract template for managing a trust registry.
--- This contract acts as a factory for creating TrustedProviderRole proposals.
--- In a real-world scenario, the creation of this initial registry might be
--- governed by a consortium or a regulatory body.
-template TrustRegistry
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, Implementation, View(..), setObserversImpl, view)
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+-- | A registry contract that maintains a set of trusted KYC providers.
+-- The `authority` is the entity responsible for managing the list of providers.
+-- This contract is observable by the authority, all listed providers, and any
+-- explicitly added observers.
+template ProviderRegistry
   with
-    admin : Party -- ^ The sole administrator of this registry.
+    authority : Party
+      -- ^ The party that manages the registry.
+    providers : Set Party
+      -- ^ The set of parties recognized as trusted KYC providers.
+    observers : Set Party
+      -- ^ Additional parties who can observe the registry's state.
   where
-    signatory admin
+    signatory authority
+    observer union [providers, observers, Set.singleton authority]
 
-    -- Ensures that there is only one TrustRegistry per administrator.
-    key admin : Party
-    maintainer key
+    key authority : Party
+    maintainer key.authority
 
-    choice OfferProviderRole : ContractId TrustedProviderRoleProposal
-      -- ^ The admin can offer a trusted provider role to another party.
+    interface instance Disclosure.I for ProviderRegistry where
+      view = Disclosure.View with
+        disclosingParties = Set.singleton authority
+        observers
+      setObservers = Disclosure.setObserversImpl
+
+    -- | Choice for the authority to add a new KYC provider to the trusted set.
+    choice AddProvider : ContractId ProviderRegistry
       with
-        provider : Party -- ^ The party to be onboarded as a KYC provider.
-      controller admin
+        newProvider : Party
+          -- ^ The party to be added as a trusted provider.
+      controller authority
       do
-        -- Ensure the admin is not trying to add themselves as a provider.
-        assertMsg "Provider cannot be the same as the admin." (admin /= provider)
+        assertMsg "Provider is already in the registry." $
+          not $ Set.member newProvider providers
+        create this with providers = Set.insert newProvider this.providers
 
-        create TrustedProviderRoleProposal with
-          admin = admin
-          provider = provider
-
--- | A proposal for a Party to be designated as a trusted KYC Provider.
--- This follows the standard proposal/acceptance pattern to ensure mutual consent.
--- The `provider` must accept this proposal to formalize their role.
-template TrustedProviderRoleProposal
-  with
-    admin    : Party  -- ^ The administrator of the trust registry.
-    provider : Party  -- ^ The party being proposed as a trusted provider.
-  where
-    signatory admin
-    observer provider
-
-    choice AcceptProviderRole : ContractId TrustedProviderRole
-      -- ^ The proposed provider accepts the role, creating the official
-      -- TrustedProviderRole contract.
-      controller provider
+    -- | Choice for the authority to remove a KYC provider from the trusted set.
+    choice RemoveProvider : ContractId ProviderRegistry
+      with
+        providerToRemove : Party
+          -- ^ The party to be removed from the trusted provider list.
+      controller authority
       do
-        create TrustedProviderRole with admin, provider
+        assertMsg "Provider is not in the registry." $
+          Set.member providerToRemove providers
+        create this with providers = Set.delete providerToRemove this.providers
 
-    choice DeclineProviderRole : ()
-      -- ^ The proposal is declined by the provider or withdrawn by the admin.
-      controller provider, admin
+    -- | Non-consuming choice to check if a given party is a trusted provider.
+    -- This can be called by any observer of the contract.
+    nonconsuming choice IsProviderTrusted : Bool
+      with
+        providerToCheck : Party
+          -- ^ The party whose trust status is being queried.
+      controller union [observers, providers, Set.singleton authority]
       do
-        archive self
+        return $ Set.member providerToCheck providers
 
--- | Represents a trusted KYC provider within a specific registry.
--- The existence of this contract on the ledger serves as proof that the
--- 'provider' is authorized by the 'admin' to issue KYC attestations.
--- Other contracts can query for this contract to verify an attestation's issuer.
-template TrustedProviderRole
-  with
-    admin    : Party  -- ^ The administrator of the trust registry.
-    provider : Party  -- ^ The party designated as a trusted KYC provider.
-  where
-    signatory admin, provider
+-- | Helper type for fetching a `ProviderRegistry` contract by its key.
+type ProviderRegistryKey = Party
 
-    -- The key ensures that for a given admin, a party can only be a trusted
-    -- provider once. It also allows other contracts to easily and efficiently
-    -- look up this role using `lookupByKey`.
-    key (admin, provider) : (Party, Party)
-    maintainer key._1
+-- | Interface to abstract over the functionality of a trust registry.
+-- This allows other contracts to depend on the interface rather than the
+-- concrete `ProviderRegistry` template, making the system more modular.
+interface Registry where
+  viewtype V
 
-    choice RemoveProvider : ()
-      -- ^ The administrator can revoke the provider's trusted status by
-      -- archiving this contract. This is a critical governance function.
-      controller admin
-      do
-        archive self
+  -- | Retrieves the view of the registry.
+  asProviderRegistry : ProviderRegistry
+  asProviderRegistry = toInterface @Registry self
+
+  -- | Checks if a provider is trusted.
+  isTrusted : Party -> Update Bool
+  -- | Adds a provider to the registry.
+  addProvider : Party -> Update (ContractId Registry)
+  -- | Removes a provider from the registry.
+  removeProvider : Party -> Update (ContractId Registry)
+
+  -- Default implementations
+  isTrusted provider = exercise (toInterfaceContractId @ProviderRegistry self) IsProviderTrusted with providerToCheck = provider
+  addProvider provider = exercise (toInterfaceContractId @ProviderRegistry self) AddProvider with newProvider = provider
+  removeProvider provider = exercise (toInterfaceContractId @ProviderRegistry self) RemoveProvider with providerToRemove = provider
+
+
+instance Registry for ProviderRegistry where
+  viewtype V = V with authority : Party, providers : Set Party
+  asProviderRegistry = this
+  isTrusted = isTrusted @Registry
+  addProvider = addProvider @Registry
+  removeProvider = removeProvider @Registry
