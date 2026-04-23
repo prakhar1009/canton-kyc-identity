@@ -1,140 +1,220 @@
-module Identity where
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
+module Daml.Identity where
+
+import Daml.Script
 import DA.Date
-import DA.Optional (isSome)
-import DA.List (elem, find, map, filter)
+import DA.Time
+import DA.Assert
+import DA.Set (fromList, toList)
+import Daml.MultiAttestation
 
--- | Represents the type of a KYC/identity attestation.
--- This allows for an extensible set of verifiable claims.
-data AttestationType
-  = AML_Clear -- Anti-Money Laundering check passed
-  | PEP_Clear -- Politically Exposed Person check passed
-  | AccreditedInvestor -- Meets criteria for an accredited investor
-  | Sanctions_Clear -- Not on any sanctions lists
-  | VerifiedAddress -- Physical address has been verified
-  deriving (Eq, Show, Ord)
-
--- | Represents a single verifiable claim made by a provider about an identity owner.
-data Attestation = Attestation
-  { provider : Party
-  , attestationType : AttestationType
-  , validFrom : Date
-  , validUntil : Optional Date
-  , attestationId : Text -- A unique identifier for this attestation from the provider's system
-  , revoked : Bool
-  } deriving (Eq, Show)
-
--- | A helper function to check if an attestation is currently valid.
--- It checks that the current date is within the validity period and the attestation is not revoked.
-isAttestationValid : Date -> Attestation -> Bool
-isAttestationValid currentDate att =
-  let
-    isAfterFrom = currentDate >= att.validFrom
-    isBeforeUntil = case att.validUntil of
-      None -> True
-      Some endDate -> currentDate <= endDate
-  in
-    not att.revoked && isAfterFrom && isBeforeUntil
-
--- | Represents a digital identity for a party on the Canton Network.
--- This contract is controlled by the owner and can be observed by authorized identity providers.
--- It serves as a central registry for KYC attestations.
+-- | Represents a verified identity for a Party on the network.
+-- This contract is the root object that links a Party to their various attestations.
+-- It is controlled by both the identity owner and the issuing provider, allowing
+-- for secure, auditable management of identity status and visibility.
 template Identity
   with
-    owner : Party
-      -- ^ The party whose identity this contract represents.
-    providers : [Party]
-      -- ^ A list of trusted parties authorized to add attestations to this identity.
-    attestations : [Attestation]
-      -- ^ A list of all attestations, past and present, associated with the owner.
+    owner: Party
+      -- ^ The party whose identity is being represented.
+    provider: Party
+      -- ^ The identity provider who verified and issued this identity.
+    observers: [Party]
+      -- ^ A list of parties who are permitted to view this identity and its attestations.
+    attestationCids: [ContractId MultiAttestation]
+      -- ^ A list of contract IDs for the underlying attestations (e.g., KYC, AML).
+    isActive: Bool
+      -- ^ A flag indicating whether the identity is currently valid or has been revoked.
+    createdAt: Time
+      -- ^ The timestamp when the identity was first created.
+    updatedAt: Time
+      -- ^ The timestamp of the last modification to this identity.
   where
-    signatory owner
-    observer providers
+    signatory owner, provider
+    observer toList $ fromList observers -- Ensure observers are unique
 
-    key owner : Party
-    maintainer key
-
-    -- | Allows an authorized provider to add a new attestation to the identity.
-    choice AddAttestation : ContractId Identity
-      with
-        attestationType : AttestationType
-        validFrom : Date
-        validUntil : Optional Date
-        attestationId : Text
-      controller p : Party
-      do
-        -- Ensure the controller is an authorized provider.
-        assertMsg (p `elem` providers)
-          ("Party " <> show p <> " is not an authorized provider for this identity.")
-
-        -- Ensure the validity period is logical.
-        assertMsg (case validUntil of None -> True; Some u -> validFrom <= u)
-          ("The 'validFrom' date must be on or before the 'validUntil' date.")
-        
-        -- Ensure the attestation ID is unique for this provider.
-        assertMsg (isNone $ find (\a -> a.provider == p && a.attestationId == attestationId) attestations)
-          ("Attestation ID " <> attestationId <> " is already in use by provider " <> show p <> ".")
-
-        let newAttestation = Attestation with
-              provider = p
-              , attestationType
-              , validFrom
-              , validUntil
-              , attestationId
-              , revoked = False
-
-        create this with
-          attestations = newAttestation :: attestations
-
-    -- | Allows the provider who issued an attestation to revoke it.
-    choice RevokeAttestation : ContractId Identity
-      with
-        attestationIdToRevoke : Text
-      controller p : Party
-      do
-        let
-          -- Find the attestation to revoke and check if the controller is the provider.
-          maybeTargetAttestation = find (\a -> a.attestationId == attestationIdToRevoke && a.provider == p) attestations
-
-        -- Ensure the attestation exists and was issued by the controller.
-        assertMsg (isSome maybeTargetAttestation)
-          ("Attestation with ID " <> attestationIdToRevoke <> " not found or you are not the provider.")
-
-        let
-          -- Function to update the 'revoked' flag of the target attestation.
-          revokeIfTarget att =
-            if att.attestationId == attestationIdToRevoke && att.provider == p then
-              att with revoked = True
-            else
-              att
-          
-          updatedAttestations = map revokeIfTarget attestations
-
-        create this with
-          attestations = updatedAttestations
-
-    -- | Allows the identity owner to authorize a new provider.
-    choice AddProvider : ContractId Identity
-      with
-        newProvider : Party
+    -- The owner can unilaterally decide to archive their identity contract.
+    choice ArchiveIdentity: ()
       controller owner
       do
-        -- Ensure the new provider is not already authorized.
-        assertMsg (not $ newProvider `elem` providers)
-          ("Party " <> show newProvider <> " is already an authorized provider.")
-        
-        create this with
-          providers = newProvider :: providers
+        pure ()
 
-    -- | Allows the identity owner to de-authorize an existing provider.
-    choice RemoveProvider : ContractId Identity
+    -- The provider can revoke the identity, for example, if the underlying
+    -- attestations are no longer valid.
+    choice Revoke: ContractId Identity
+      controller provider
+      do
+        now <- getTime
+        assertMsg "Identity is already revoked." isActive
+        create this with
+          isActive = False
+          updatedAt = now
+
+    -- The provider can reinstate a previously revoked identity.
+    choice Reinstate: ContractId Identity
+      controller provider
+      do
+        now <- getTime
+        assertMsg "Identity is already active." (not isActive)
+        create this with
+          isActive = True
+          updatedAt = now
+
+    -- The owner can add a new attestation to their identity. This requires the
+    -- provider's consent to ensure the new attestation is valid.
+    choice AddAttestation: ContractId Identity
       with
-        providerToRemove : Party
+        newAttestationCid: ContractId MultiAttestation
+      controller owner, provider
+      do
+        now <- getTime
+        -- Verify that the new attestation is for the correct owner and provider.
+        attestation <- fetch newAttestationCid
+        assertMsg "New attestation must belong to the identity owner." $
+          attestation.owner == owner
+        assertMsg "New attestation must be from the identity provider." $
+          attestation.provider == provider
+
+        create this with
+          attestationCids = newAttestationCid :: attestationCids
+          updatedAt = now
+
+    -- The owner can share their identity with a new party, granting them observer rights.
+    choice ShareWith: ContractId Identity
+      with
+        newObserver: Party
       controller owner
       do
-        -- Ensure the provider to be removed is in the current list.
-        assertMsg (providerToRemove `elem` providers)
-          ("Party " <> show providerToRemove <> " is not in the list of authorized providers.")
+        now <- getTime
+        assertMsg "Cannot share with existing owner, provider, or observer."
+          (notElem newObserver (owner :: provider :: observers))
 
         create this with
-          providers = filter (\p -> p /= providerToRemove) providers
+          observers = newObserver :: observers
+          updatedAt = now
+
+    -- The owner can revoke a party's observer rights.
+    choice UnshareWith: ContractId Identity
+      with
+        observerToRemove: Party
+      controller owner
+      do
+        now <- getTime
+        assertMsg "Party to remove is not an existing observer."
+          (elem observerToRemove observers)
+
+        create this with
+          observers = filter (\p -> p /= observerToRemove) observers
+          updatedAt = now
+
+-- | A test suite for the Identity template and its choices.
+test_IdentityLifecycle : Script ()
+test_IdentityLifecycle = script do
+  -- 1. Setup Parties
+  owner <- allocatePartyWithHint "Owner" (PartyIdHint "owner")
+  provider <- allocatePartyWithHint "Provider" (PartyIdHint "provider")
+  observer1 <- allocatePartyWithHint "Observer1" (PartyIdHint "observer1")
+  observer2 <- allocatePartyWithHint "Observer2" (PartyIdHint "observer2")
+
+  -- 2. Create initial Attestation
+  now <- getTime
+  let attestationPayload =
+        "{\"kycLevel\": \"Full\", \"jurisdiction\": \"CH\", \"verificationDate\": \"" <> show now <> "\"}"
+
+  initialAttestationCid <- submit provider do
+    createCmd MultiAttestation with
+      owner
+      provider
+      observers = []
+      attestationType = "KYC"
+      payload = attestationPayload
+      expiryDate = Some $ addDays (toDateUTC now) 365
+      createdAt = now
+
+  -- 3. Create Identity
+  initialIdentityCid <- submitMulti [owner, provider] [] do
+    createCmd Identity with
+      owner
+      provider
+      observers = [observer1]
+      attestationCids = [initialAttestationCid]
+      isActive = True
+      createdAt = now
+      updatedAt = now
+
+  initialIdentity <- fetch initialIdentityCid
+  initialIdentity.owner === owner
+  initialIdentity.provider === provider
+  initialIdentity.observers === [observer1]
+  assert initialIdentity.isActive
+
+  -- 4. Share with a new observer
+  sharedIdentityCid <- submit owner do
+    exerciseCmd initialIdentityCid ShareWith with newObserver = observer2
+
+  sharedIdentity <- fetch sharedIdentityCid
+  sharedIdentity.observers === [observer2, observer1]
+
+  -- 5. Attempt to share with an existing observer (should fail)
+  submitMustFail owner do
+    exerciseCmd sharedIdentityCid ShareWith with newObserver = observer1
+
+  -- 6. Provider revokes the identity
+  revokedIdentityCid <- submit provider do
+    exerciseCmd sharedIdentityCid Revoke
+
+  revokedIdentity <- fetch revokedIdentityCid
+  assert (not revokedIdentity.isActive)
+  assert (revokedIdentity.updatedAt > revokedIdentity.createdAt)
+
+  -- 7. Attempt to revoke again (should fail)
+  submitMustFail provider do
+    exerciseCmd revokedIdentityCid Revoke
+
+  -- 8. Provider reinstates the identity
+  reinstatedIdentityCid <- submit provider do
+    exerciseCmd revokedIdentityCid Reinstate
+
+  reinstatedIdentity <- fetch reinstatedIdentityCid
+  assert reinstatedIdentity.isActive
+
+  -- 9. Owner and Provider add a new attestation
+  let amlPayload = "{\"amlCheck\": \"Passed\", \"checkDate\": \"" <> show now <> "\"}"
+  newAttestationCid <- submit provider do
+    createCmd MultiAttestation with
+      owner
+      provider
+      observers = []
+      attestationType = "AML"
+      payload = amlPayload
+      expiryDate = None
+      createdAt = now
+
+  updatedIdentityCid <- submitMulti [owner, provider] [] do
+    exerciseCmd reinstatedIdentityCid AddAttestation with newAttestationCid
+
+  updatedIdentity <- fetch updatedIdentityCid
+  length updatedIdentity.attestationCids === 2
+  assert (elem newAttestationCid updatedIdentity.attestationCids)
+
+  -- 10. Owner removes an observer
+  finalIdentityCid <- submit owner do
+    exerciseCmd updatedIdentityCid UnshareWith with observerToRemove = observer1
+
+  finalIdentity <- fetch finalIdentityCid
+  finalIdentity.observers === [observer2]
+
+  -- 11. Attempt to remove a non-existent observer (should fail)
+  submitMustFail owner do
+    exerciseCmd finalIdentityCid UnshareWith with observerToRemove = observer1
+
+  -- 12. Owner archives the final identity
+  submit owner do
+    exerciseCmd finalIdentityCid ArchiveIdentity
+
+  -- 13. Query active contracts to ensure it's gone
+  contracts <- query @Identity owner
+  assert (null contracts)
+
+  pure ()
