@@ -1,294 +1,237 @@
-import React, { useState, useMemo } from 'react';
-import { DamlLedger, useLedger, useParty, useStreamQueries, useQuery } from "@c7/react";
-import { Attestation, ProviderRole } from '@daml.js/canton-kyc-identity-0.1.0/lib/KYC';
-import { TrustedProvider, TrustRegistry } from '@daml.js/canton-kyc-identity-0.1.0/lib/TrustRegistry';
-import { ContractId } from '@daml/types';
-import './App.css';
+import React, { useState } from 'react';
+import { DamlLedger, useParty, useLedger, useStreamQueries, Contract } from '@c7/react';
+import { Role } from './daml/gen/Kyc/V1/Provider';
+import { Attestation, Revoked } from './daml/gen/Kyc/V1/Attestation';
+
+const WS_URL = "ws://localhost:6867"; // Canton Sandbox gRPC-Web port
+const HTTP_URL = "http://localhost:7575"; // Canton Sandbox JSON API port
+const DEFAULT_PARTY = "RegistryAdmin"; // Default party for the admin UI
 
 const App: React.FC = () => {
-  const [credentials, setCredentials] = useState<{party: string; token: string} | undefined>();
+  // Simple auth model: use a hardcoded token or get it from localStorage.
+  // In a real app, this would involve a proper login flow (e.g., OIDC).
+  const [token, setToken] = useState<string | null>(localStorage.getItem("daml-token"));
 
-  const logout = () => {
-    setCredentials(undefined);
+  const handleLogin = (newToken: string) => {
+    localStorage.setItem("daml-token", newToken);
+    setToken(newToken);
   };
 
-  if (!credentials) {
-    return <LoginScreen onLogin={setCredentials} />;
-  } else {
-    return (
-      <DamlLedger party={credentials.party} token={credentials.token} httpBaseUrl="http://localhost:7575">
-        <MainScreen onLogout={logout} />
-      </DamlLedger>
-    );
-  }
-};
-
-const LoginScreen: React.FC<{onLogin: (creds: {party: string; token: string}) => void}> = ({ onLogin }) => {
-  const [party, setParty] = useState('');
-  const [token, setToken] = useState('');
-
-  // Pre-populate with typical sandbox values for convenience
-  React.useEffect(() => {
-    setParty("Operator");
-    const generatedToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJodHRwczovL2RhbWwuY29tL2xlZGdlci1hcGkiOnsibGVkZ2VySWQiOiJteWxvY2FsbGVkZ2VyIiwiYXBwbGljYXRpb25JZCI6Imh0dHAtanNvbi1hcGktZ2F0ZXdheSIsInBhcnR5IjoiT3BlcmF0b3IiLCJhY3RBcyI6WyJPcGVyYXRvciJdfX0.k26acmhiNm25Y6jTDEmRk5nPqBPO2JAl2YVO3R6l_qA";
-    setToken(generatedToken);
-  }, []);
-
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    onLogin({ party, token });
+  const handleLogout = () => {
+    localStorage.removeItem("daml-token");
+    setToken(null);
   };
 
   return (
-    <div className="login-container">
-      <div className="login-form">
-        <h1>Canton KYC Admin</h1>
-        <p>Log in as Operator or a trusted Provider.</p>
-        <form onSubmit={handleLogin}>
-          <div className="form-group">
-            <label>Party ID</label>
-            <input type="text" value={party} onChange={e => setParty(e.target.value)} placeholder="e.g. Operator" required />
-          </div>
-          <div className="form-group">
-            <label>DAML Ledger Token (JWT)</label>
-            <input type="password" value={token} onChange={e => setToken(e.target.value)} required />
-          </div>
-          <button type="submit">Login</button>
-        </form>
-      </div>
-    </div>
-  );
-};
-
-const MainScreen: React.FC<{onLogout: () => void}> = ({ onLogout }) => {
-  const party = useParty();
-  return (
-    <div className="main-screen">
-      <header>
-        <h1>KYC Identity Admin Dashboard</h1>
-        <div className="header-info">
-          <span>Logged in as: <strong>{party}</strong></span>
-          <button onClick={onLogout}>Logout</button>
-        </div>
+    <div style={styles.appContainer}>
+      <header style={styles.header}>
+        <h1 style={styles.title}>Canton KYC Identity - Admin Dashboard</h1>
+        {token && <button onClick={handleLogout} style={styles.logoutButton}>Logout</button>}
       </header>
-      <main>
-        <div className="panel">
-          <TrustRegistryPanel />
-        </div>
-        <div className="panel">
-          <AttestationPanel />
-        </div>
+      <main style={styles.mainContent}>
+        {!token ? (
+          <LoginScreen onLogin={handleLogin} />
+        ) : (
+          <DamlLedger token={token} party={DEFAULT_PARTY} httpBaseUrl={HTTP_URL} wsBaseUrl={WS_URL}>
+            <AdminDashboard />
+          </DamlLedger>
+        )}
       </main>
     </div>
   );
 };
 
-const TrustRegistryPanel: React.FC = () => {
-  const ledger = useLedger();
-  const party = useParty();
-  const { contracts: registries, loading: registryLoading } = useQuery(TrustRegistry);
-  const { contracts: providers, loading: providersLoading } = useStreamQueries(TrustedProvider);
+const LoginScreen: React.FC<{ onLogin: (token: string) => void }> = ({ onLogin }) => {
+  const [tokenInput, setTokenInput] = useState("");
+  const [partyInput, setPartyInput] = useState(DEFAULT_PARTY);
+  const [error, setError] = useState("");
 
-  const [newProvider, setNewProvider] = useState('');
-  const [newProviderName, setNewProviderName] = useState('');
-
-  const trustRegistryCid = useMemo(() => {
-    if (registries.length > 0) {
-      return registries[0].contractId;
-    }
-    return null;
-  }, [registries]);
-
-  const handleAddProvider = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!trustRegistryCid || !newProvider || !newProviderName) {
-      alert("Trust Registry not found or form is incomplete.");
-      return;
-    }
+  const generateDevToken = async () => {
+    setError("");
     try {
-      await ledger.exercise(TrustRegistry.AddProvider, trustRegistryCid, { provider: newProvider, providerName: newProviderName });
-      setNewProvider('');
-      setNewProviderName('');
-    } catch (error) {
-      console.error("Error adding provider:", error);
-      alert(`Failed to add provider: ${error}`);
+      // NOTE: This is a simplified, insecure JWT generator for local development ONLY.
+      // In production, tokens must be generated by a secure, trusted authentication service.
+      const payload = {
+        "https://daml.com/ledger-api": {
+          "ledgerId": "sandbox", // This must match your sandbox ledgerId
+          "applicationId": "kyc-admin-ui",
+          "actAs": [partyInput],
+          "readAs": [partyInput]
+        }
+      };
+      const header = { "alg": "HS256", "typ": "JWT" };
+      const secret = "secret"; // Default secret for `dpm sandbox`
+      const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+      const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+      const data = `${encodedHeader}.${encodedPayload}`;
+      
+      // A real signature would use crypto libraries. For sandbox with a known secret, this is a placeholder.
+      // This is NOT a valid HMAC-SHA256 signature. `dpm sandbox` accepts it due to lax validation.
+      const dummySignature = "dummy-signature-for-dev-only";
+      
+      const token = `${data}.${dummySignature}`;
+      setTokenInput(token);
+    } catch (err) {
+      setError("Failed to generate token.");
+      console.error(err);
     }
   };
-
-  const handleRevokeProvider = async (cid: ContractId<TrustedProvider>) => {
-    if (!window.confirm("Are you sure you want to revoke this provider?")) return;
-    try {
-      await ledger.exercise(TrustedProvider.Revoke, cid, {});
-    } catch (error) {
-      console.error("Error revoking provider:", error);
-      alert(`Failed to revoke provider: ${error}`);
-    }
-  };
-
-  if (registryLoading || providersLoading) return <div>Loading registry data...</div>;
 
   return (
-    <div className="trust-registry-panel">
-      <h2>Trusted Providers</h2>
-      <div className="card">
-        <h3>Add New Provider</h3>
-        <form onSubmit={handleAddProvider}>
-          <div className="form-row">
-            <div className="form-group">
-              <label>Provider Party ID</label>
-              <input type="text" value={newProvider} onChange={e => setNewProvider(e.target.value)} placeholder="ProviderPartyId" required />
-            </div>
-            <div className="form-group">
-              <label>Provider Name</label>
-              <input type="text" value={newProviderName} onChange={e => setNewProviderName(e.target.value)} placeholder="e.g. Verified Inc." required />
-            </div>
-          </div>
-          <button type="submit" disabled={!trustRegistryCid}>Add Provider</button>
-          {!trustRegistryCid && <p className="error-text">No TrustRegistry contract found for party '{party}'. This action is Operator-only.</p>}
-        </form>
+    <div style={styles.loginContainer}>
+      <h2>Admin Login</h2>
+      <p>Enter the admin party ID and a valid JWT to connect to the ledger.</p>
+      <input
+        type="text"
+        placeholder="Admin Party ID"
+        value={partyInput}
+        onChange={(e) => setPartyInput(e.target.value)}
+        style={styles.input}
+        disabled // Keeping it fixed for this UI
+      />
+      <textarea
+        placeholder="JWT Token"
+        value={tokenInput}
+        onChange={(e) => setTokenInput(e.target.value)}
+        style={{ ...styles.input, height: '100px' }}
+      />
+      <button onClick={() => onLogin(tokenInput)} style={styles.button}>Login</button>
+      <button onClick={generateDevToken} style={{...styles.button, marginLeft: 10}}>Generate Dev Token</button>
+      {error && <p style={styles.error}>{error}</p>}
+      <p style={styles.info}>For local `dpm sandbox`, you can generate a development token for the default admin party.</p>
+    </div>
+  );
+};
+
+const AdminDashboard: React.FC = () => {
+  const party = useParty();
+  const ledger = useLedger();
+
+  const { contracts: providers, loading: providersLoading } = useStreamQueries(Role);
+  const { contracts: activeAttestations, loading: attestationsLoading } = useStreamQueries(Attestation);
+  const { contracts: revokedAttestations, loading: revokedLoading } = useStreamQueries(Revoked);
+
+  const handleRevoke = async (attestation: Contract<Attestation>) => {
+    if (window.confirm(`Are you sure you want to revoke the attestation for ${attestation.payload.subject}?`)) {
+      try {
+        await ledger.exercise(Attestation.Revoke, attestation.contractId, {});
+        alert("Attestation revoked successfully.");
+      } catch (error) {
+        console.error("Failed to revoke attestation:", error);
+        alert(`Error: ${error}`);
+      }
+    }
+  };
+
+  return (
+    <div>
+      <h2 style={styles.sectionTitle}>Welcome, {party}</h2>
+
+      <div style={styles.section}>
+        <h3 style={styles.subTitle}>Registered Identity Providers</h3>
+        <Table
+          headers={["Provider Party", "Display Name", "Jurisdiction"]}
+          rows={providers.map(p => [
+            p.payload.provider,
+            p.payload.displayName,
+            p.payload.jurisdiction
+          ])}
+          loading={providersLoading}
+        />
       </div>
 
-      <div className="card">
-        <h3>Current Providers</h3>
-        {providers.length === 0 ? <p>No trusted providers found.</p> : (
-          <table>
-            <thead>
-              <tr>
-                <th>Provider Name</th>
-                <th>Party ID</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {providers.map(p => (
-                <tr key={p.contractId}>
-                  <td>{p.payload.providerName}</td>
-                  <td>{p.payload.provider}</td>
-                  <td>
-                    <button className="danger" onClick={() => handleRevokeProvider(p.contractId)} disabled={!trustRegistryCid}>Revoke</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+      <div style={styles.section}>
+        <h3 style={styles.subTitle}>Active KYC Attestations</h3>
+        <Table
+          headers={["Subject", "Provider", "Type", "Issued", "Expires", "Actions"]}
+          rows={activeAttestations.map(a => [
+            a.payload.subject,
+            a.payload.provider,
+            a.payload.attestationType,
+            new Date(a.payload.issueDate).toLocaleDateString(),
+            a.payload.expiryDate ? new Date(a.payload.expiryDate).toLocaleDateString() : "N/A",
+            <button
+              onClick={() => handleRevoke(a)}
+              style={styles.actionButton}
+            >
+              Revoke
+            </button>
+          ])}
+          loading={attestationsLoading}
+        />
+      </div>
+
+      <div style={styles.section}>
+        <h3 style={styles.subTitle}>Revoked Attestations</h3>
+        <Table
+          headers={["Subject", "Provider", "Type", "Revoked By", "Revocation Date"]}
+          rows={revokedAttestations.map(r => [
+            r.payload.attestation.subject,
+            r.payload.attestation.provider,
+            r.payload.attestation.attestationType,
+            r.payload.revokedBy,
+            new Date(r.payload.revocationTime).toLocaleString()
+          ])}
+          loading={revokedLoading}
+        />
       </div>
     </div>
   );
 };
 
-const AttestationPanel: React.FC = () => {
-    const ledger = useLedger();
-    const party = useParty();
-    const { contracts: providerRoles, loading: rolesLoading } = useQuery(ProviderRole, () => [{provider: party}]);
-    const { contracts: attestations, loading: attestationsLoading } = useStreamQueries(Attestation);
+interface TableProps {
+    headers: string[];
+    rows: (string | React.ReactNode)[][];
+    loading?: boolean;
+}
 
-    const [subject, setSubject] = useState('');
-    const [attestationId, setAttestationId] = useState('');
-    const [expiryDate, setExpiryDate] = useState(new Date(new Date().setFullYear(new Date().getFullYear() + 1)).toISOString().split('T')[0]); // Default to 1 year from now
-
-    const providerRoleCid = useMemo(() => {
-        if (providerRoles.length > 0) {
-            return providerRoles[0].contractId;
-        }
-        return null;
-    }, [providerRoles]);
-
-    const handleIssueAttestation = async (e: React.FormEvent) => {
-        e.preventDefault();
-        if (!providerRoleCid) {
-            alert("Provider Role not found for your party. Can't issue attestations.");
-            return;
-        }
-        try {
-            await ledger.exercise(ProviderRole.IssueAttestation, providerRoleCid, {
-                subject: subject,
-                id: attestationId,
-                expiry: expiryDate,
-            });
-            setSubject('');
-            setAttestationId('');
-        } catch (error) {
-            console.error("Error issuing attestation:", error);
-            alert(`Failed to issue attestation: ${error}`);
-        }
-    };
-
-    const handleRevokeAttestation = async (cid: ContractId<Attestation>) => {
-        if (!window.confirm("Are you sure you want to revoke this attestation?")) return;
-        try {
-            await ledger.exercise(Attestation.Revoke, cid, { reason: "Admin revocation" });
-        } catch (error) {
-            console.error("Error revoking attestation:", error);
-            alert(`Failed to revoke attestation: ${error}`);
-        }
-    };
-
-    if (rolesLoading || attestationsLoading) return <div>Loading attestation data...</div>;
-
-    const myAttestations = attestations.filter(a => a.payload.provider === party);
+const Table: React.FC<TableProps> = ({ headers, rows, loading }) => {
+    if (loading) {
+        return <p>Loading data...</p>;
+    }
+    if (rows.length === 0) {
+        return <p>No data available.</p>;
+    }
 
     return (
-        <div className="attestation-panel">
-            <h2>KYC Attestations</h2>
-            {providerRoleCid ? (
-                <div className="card">
-                    <h3>Issue New Attestation</h3>
-                    <form onSubmit={handleIssueAttestation}>
-                        <div className="form-row">
-                            <div className="form-group">
-                                <label>Subject Party ID</label>
-                                <input type="text" value={subject} onChange={e => setSubject(e.target.value)} placeholder="SubjectPartyId" required />
-                            </div>
-                            <div className="form-group">
-                                <label>Attestation ID</label>
-                                <input type="text" value={attestationId} onChange={e => setAttestationId(e.target.value)} placeholder="Unique ID (e.g., UUID)" required />
-                            </div>
-                            <div className="form-group">
-                                <label>Expiry Date</label>
-                                <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} required />
-                            </div>
-                        </div>
-                        <button type="submit">Issue Attestation</button>
-                    </form>
-                </div>
-            ) : (
-                <div className="card notice">
-                    <p>Your party (<strong>{party}</strong>) does not have a ProviderRole. Only trusted providers can issue attestations.</p>
-                </div>
-            )}
-
-            <div className="card">
-                <h3>Issued Attestations (by {party})</h3>
-                {myAttestations.length === 0 ? <p>No attestations issued by this party.</p> : (
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Subject</th>
-                                <th>Provider</th>
-                                <th>Expiry</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {myAttestations.map(a => (
-                                <tr key={a.contractId}>
-                                    <td>{a.payload.id}</td>
-                                    <td>{a.payload.subject}</td>
-                                    <td>{a.payload.provider}</td>
-                                    <td>{a.payload.expiry}</td>
-                                    <td>
-                                        <button className="danger" onClick={() => handleRevokeAttestation(a.contractId)}>Revoke</button>
-                                    </td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                )}
-            </div>
-        </div>
+        <table style={styles.table}>
+            <thead>
+                <tr>
+                    {headers.map(h => <th key={h} style={styles.th}>{h}</th>)}
+                </tr>
+            </thead>
+            <tbody>
+                {rows.map((row, i) => (
+                    <tr key={i} style={styles.tr}>
+                        {row.map((cell, j) => (
+                            <td key={j} style={styles.td}>{cell}</td>
+                        ))}
+                    </tr>
+                ))}
+            </tbody>
+        </table>
     );
+};
+
+const styles: { [key: string]: React.CSSProperties } = {
+  appContainer: { fontFamily: 'Arial, sans-serif', color: '#333' },
+  header: { backgroundColor: '#003366', color: 'white', padding: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  title: { margin: 0, fontSize: '1.5rem' },
+  logoutButton: { backgroundColor: '#fff', color: '#003366', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' },
+  mainContent: { padding: '1rem' },
+  loginContainer: { maxWidth: '500px', margin: '50px auto', padding: '2rem', border: '1px solid #ccc', borderRadius: '8px', textAlign: 'center', boxShadow: '0 4px 8px rgba(0,0,0,0.1)' },
+  input: { width: 'calc(100% - 22px)', padding: '10px', margin: '10px 0', borderRadius: '4px', border: '1px solid #ccc', fontSize: '1rem' },
+  button: { backgroundColor: '#0055a5', color: 'white', padding: '10px 20px', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '1rem' },
+  error: { color: 'red' },
+  info: { fontSize: '0.8rem', color: '#666', marginTop: '1rem' },
+  section: { marginBottom: '2rem', padding: '1rem', border: '1px solid #eee', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', backgroundColor: '#fff' },
+  sectionTitle: { borderBottom: '2px solid #003366', paddingBottom: '0.5rem', marginBottom: '1rem' },
+  subTitle: { color: '#003366' },
+  table: { width: '100%', borderCollapse: 'collapse', marginTop: '1rem' },
+  th: { backgroundColor: '#f2f2f2', textAlign: 'left', padding: '12px', borderBottom: '2px solid #ddd', textTransform: 'uppercase', fontSize: '0.85rem' },
+  tr: { '&:hover': { backgroundColor: '#f9f9f9' } },
+  td: { padding: '12px', borderBottom: '1px solid #ddd', verticalAlign: 'middle' },
+  actionButton: { backgroundColor: '#d9534f', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px', cursor: 'pointer', '&:hover': { backgroundColor: '#c9302c' } },
 };
 
 export default App;
