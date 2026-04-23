@@ -1,267 +1,313 @@
-// Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+import { encode } from 'js-base64';
 
-import { CreateEvent, Event, ExerciseEvent } from "@daml/ledger";
+// =================================================================================================
+// Constants and Configuration
+// =================================================================================================
 
-// --- Custom branded type for ContractId for type safety ---
-export type ContractId<T> = string & { __brand: T };
+const LEDGER_URL = process.env.REACT_APP_LEDGER_URL || 'http://localhost:7575';
+const API_BASE_V1 = `${LEDGER_URL}/v1`;
+const API_BASE_V2 = `${LEDGER_URL}/v2`;
 
-// --- Daml Types (mirroring Daml templates) ---
+// NOTE: These template IDs should match your compiled Daml model.
+// Using a placeholder for the package ID which should be dynamically discovered
+// or configured in a real application.
+const MAIN_PACKAGE_ID = "kyc-identity-0.1.0"; // Adjust if your package name/version is different
+const TEMPLATE_IDS = {
+  ProviderRole: `${MAIN_PACKAGE_ID}:Kyc.Provider:ProviderRole`,
+  AttestationRequest: `${MAIN_PACKAGE_ID}:Kyc.Attestation:AttestationRequest`,
+  Attestation: `${MAIN_PACKAGE_ID}:Kyc.Attestation:Attestation`,
+  CustomerInvite: `${MAIN_PACKAGE_ID}:Kyc.Customer:CustomerInvite`,
+  CustomerRole: `${MAIN_PACKAGE_ID}:Kyc.Customer:CustomerRole`,
+};
 
-export interface Attestation {
-  provider: string;
-  owner: string;
-  attestationId: string;
-  attestationType: string;
-  expiryDate: string | null; // ISO 8601 Date string "YYYY-MM-DD" or null
-  detailsHash: string;
+// =================================================================================================
+// Type Definitions
+// =================================================================================================
+
+export type ContractId = string;
+export type Party = string;
+
+export interface Contract<T> {
+  contractId: ContractId;
+  payload: T;
+  templateId: string;
 }
 
-export interface AttestationProposal {
-  provider: string;
-  requester: string;
-  attestationType: string;
-  detailsHash: string;
-  expiryDate: string | null;
+export interface VerifiedAttribute {
+  name: string;
+  valueHash: string;
+  verifiedAt: string; // Daml Time (ISO 8601 format)
 }
 
 export interface ProviderRole {
-  provider: string;
+  provider: Party;
   displayName: string;
+  observers: Party[];
 }
 
-export interface TrustDelegation {
-  truster: string;
-  trustee: string;
-  role: string;
-  expiry: string; // ISO 8601 Time string
+export interface AttestationRequest {
+  provider: Party;
+  customer: Party;
+  requestedAttributes: string[];
+  customerNote: string;
 }
 
-// --- API Response Types ---
-
-type ApiResponse<T> = {
-  status: number;
-  result: T;
-  errors?: string[];
-  warnings?: string[];
-};
-
-type CreateResponse<T> = CreateEvent<T>;
-type ExerciseResponse<R> = {
-  exerciseResult: R;
-  events: Event<unknown>[];
-};
-type QueryResponse<T> = CreateEvent<T>[];
-type FetchResponse<T> = {
-  contractId: string;
-  payload: T;
-};
-
-
-// --- Template IDs ---
-
-const TEMPLATE_IDS = {
-  Attestation: "KYC.Attestation:Attestation",
-  AttestationProposal: "KYC.Attestation:AttestationProposal",
-  ProviderRole: "KYC.Provider:ProviderRole",
-  TrustDelegation: "Trust.Registry:TrustDelegation",
-};
-
-
-// --- Custom Error Class ---
-
-export class LedgerServiceError extends Error {
-  constructor(message: string, public details?: any) {
-    super(message);
-    this.name = "LedgerServiceError";
-  }
+export interface Attestation {
+  provider: Party;
+  subject: Party;
+  attributes: VerifiedAttribute[];
+  expiryDate: string; // Daml Date (YYYY-MM-DD)
+  revoked: boolean;
+  observers: Party[];
 }
 
-// --- KYC Service Class ---
+export interface CustomerRole {
+  customer: Party;
+  provider: Party;
+  observers: Party[];
+}
+
+// =================================================================================================
+// Internal Helper Functions
+// =================================================================================================
 
 /**
- * Provides a client for interacting with the KYC Daml ledger via the JSON API.
+ * A generic, authenticated fetch wrapper for the JSON API.
+ * @param endpoint The API endpoint (e.g., '/query').
+ * @param token The JWT for the party.
+ * @param body The request body.
+ * @param method The HTTP method.
+ * @returns The JSON response from the ledger.
  */
-export class KycService {
-  private readonly ledgerUrl: string;
-  private readonly authToken: string;
+async function fetchLedger<T>(
+  endpoint: string,
+  token: string,
+  body: object,
+  method: 'POST' | 'GET' = 'POST'
+): Promise<T> {
+  const url = `${API_BASE_V1}${endpoint}`;
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
 
-  constructor(ledgerUrl: string, authToken: string) {
-    if (!ledgerUrl || !authToken) {
-      throw new Error("Ledger URL and auth token are required.");
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Ledger API request failed with status ${response.status}: ${errorText}`);
     }
-    this.ledgerUrl = ledgerUrl.endsWith('/') ? ledgerUrl.slice(0, -1) : ledgerUrl;
-    this.authToken = authToken;
-  }
 
-  // --- Core API methods ---
-
-  private async fetchLedger<T>(
-    endpoint: string,
-    method: "GET" | "POST",
-    body?: object
-  ): Promise<ApiResponse<T>> {
-    try {
-      const response = await fetch(`${this.ledgerUrl}${endpoint}`, {
-        method,
-        headers: {
-          "Authorization": `Bearer ${this.authToken}`,
-          "Content-Type": "application/json",
-        },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new LedgerServiceError(
-          `Ledger API request failed with status ${response.status}`,
-          { status: response.status, body: errorBody }
-        );
-      }
-
-      return response.json() as Promise<ApiResponse<T>>;
-    } catch (error) {
-      if (error instanceof LedgerServiceError) {
-        throw error;
-      }
-      throw new LedgerServiceError("Network or unexpected error during ledger request.", error);
-    }
-  }
-
-  // --- Public service methods for KYC workflows ---
-
-  /**
-   * Proposes a new KYC attestation from a requester to a provider.
-   */
-  async proposeAttestation(
-    requester: string,
-    provider: string,
-    attestationType: string,
-    detailsHash: string,
-    expiryDate: Date | null,
-  ): Promise<CreateResponse<AttestationProposal>> {
-    const payload: AttestationProposal = {
-      requester,
-      provider,
-      attestationType,
-      detailsHash,
-      expiryDate: expiryDate ? expiryDate.toISOString().split("T")[0] : null,
-    };
-
-    const response = await this.fetchLedger<CreateResponse<AttestationProposal>>(
-      "/v1/create",
-      "POST",
-      {
-        templateId: TEMPLATE_IDS.AttestationProposal,
-        payload,
-      }
-    );
-    return response.result;
-  }
-
-  /**
-   * Finds an active attestation proposal for a given requester.
-   */
-  async findAttestationProposal(
-    provider: string,
-    requester: string
-  ): Promise<CreateEvent<AttestationProposal> | null> {
-    const response = await this.fetchLedger<QueryResponse<AttestationProposal>>(
-      "/v1/query",
-      "POST",
-      {
-        templateIds: [TEMPLATE_IDS.AttestationProposal],
-        query: { provider, requester },
-      }
-    );
-    return response.result.length > 0 ? response.result[0] : null;
-  }
-
-  /**
-   * Accepts an attestation proposal, creating an Attestation contract.
-   * Executed by the Identity Provider.
-   */
-  async acceptAttestationProposal(
-    proposalCid: ContractId<AttestationProposal>
-  ): Promise<ExerciseResponse<ContractId<Attestation>>> {
-    const response = await this.fetchLedger<ExerciseResponse<ContractId<Attestation>>>(
-      "/v1/exercise",
-      "POST",
-      {
-        templateId: TEMPLATE_IDS.AttestationProposal,
-        contractId: proposalCid,
-        choice: "Accept",
-        argument: {},
-      }
-    );
-    return response.result;
-  }
-
-  /**
-   * Revokes an existing KYC attestation.
-   * Executed by the Identity Provider who issued it.
-   */
-  async revokeAttestation(
-    attestationCid: ContractId<Attestation>
-  ): Promise<ExerciseResponse<void>> {
-    const response = await this.fetchLedger<ExerciseResponse<void>>(
-        "/v1/exercise",
-        "POST",
-        {
-            templateId: TEMPLATE_IDS.Attestation,
-            contractId: attestationCid,
-            choice: "Revoke",
-            argument: {},
-        }
-    );
-    return response.result;
-  }
-
-  /**
-   * Fetches all active KYC attestations for a given party (owner).
-   */
-  async getActiveAttestations(
-    owner: string
-  ): Promise<QueryResponse<Attestation>> {
-    const response = await this.fetchLedger<QueryResponse<Attestation>>(
-      "/v1/query",
-      "POST",
-      {
-        templateIds: [TEMPLATE_IDS.Attestation],
-        query: { owner },
-      }
-    );
-    return response.result;
-  }
-
-  /**
-   * Fetches the ProviderRole contract for a specific provider party.
-   */
-  async getProviderRole(provider: string): Promise<CreateEvent<ProviderRole> | null> {
-    const response = await this.fetchLedger<QueryResponse<ProviderRole>>(
-      "/v1/query",
-      "POST",
-      {
-        templateIds: [TEMPLATE_IDS.ProviderRole],
-        query: { provider },
-      }
-    );
-    return response.result.length > 0 ? response.result[0] : null;
-  }
-
-  /**
-   * Fetches all TrustDelegation contracts where the given party is the truster.
-   * This shows who the given party trusts.
-   */
-  async getTrustDelegations(truster: string): Promise<QueryResponse<TrustDelegation>> {
-    const response = await this.fetchLedger<QueryResponse<TrustDelegation>>(
-      "/v1/query",
-      "POST",
-      {
-        templateIds: [TEMPLATE_IDS.TrustDelegation],
-        query: { truster },
-      }
-    );
-    return response.result;
+    const jsonResponse = await response.json();
+    return (jsonResponse.result ?? jsonResponse) as T;
+  } catch (error) {
+    console.error(`Error during ledger request to ${url}:`, error);
+    throw error;
   }
 }
+
+// =================================================================================================
+// Public Service API
+// =================================================================================================
+
+/**
+ * Fetches all KYC provider roles visible to the user.
+ */
+export const getProviders = async (token: string): Promise<Contract<ProviderRole>[]> => {
+  return fetchLedger<Contract<ProviderRole>[]>(
+    '/query',
+    token,
+    { templateIds: [TEMPLATE_IDS.ProviderRole] }
+  );
+};
+
+/**
+ * Fetches all attestation requests for a specific provider.
+ */
+export const getAttestationRequests = async (token: string): Promise<Contract<AttestationRequest>[]> => {
+  return fetchLedger<Contract<AttestationRequest>[]>(
+    '/query',
+    token,
+    { templateIds: [TEMPLATE_IDS.AttestationRequest] }
+  );
+};
+
+/**
+ * Fetches all attestations where the current user is the subject.
+ */
+export const getMyAttestations = async (token: string): Promise<Contract<Attestation>[]> => {
+    return fetchLedger<Contract<Attestation>[]>(
+        '/query',
+        token,
+        { templateIds: [TEMPLATE_IDS.Attestation] }
+    );
+};
+
+/**
+ * For a KYC Provider to issue a new attestation in response to a request.
+ * @param token JWT of the provider party.
+ * @param requestCid The ContractId of the AttestationRequest.
+ * @param attributes The verified attributes to include in the attestation.
+ * @param expiryDate The expiration date in YYYY-MM-DD format.
+ */
+export const issueAttestation = async (
+  token: string,
+  requestCid: ContractId,
+  attributes: Omit<VerifiedAttribute, 'verifiedAt'>[],
+  expiryDate: string
+): Promise<any> => {
+  return fetchLedger(
+    '/exercise',
+    token,
+    {
+      templateId: TEMPLATE_IDS.AttestationRequest,
+      contractId: requestCid,
+      choice: 'IssueAttestation',
+      argument: {
+        attributesToVerify: attributes,
+        expiryDate: expiryDate,
+      },
+    }
+  );
+};
+
+/**
+ * For a KYC Provider to reject an attestation request.
+ * @param token JWT of the provider party.
+ * @param requestCid The ContractId of the AttestationRequest.
+ * @param reason A reason for the rejection.
+ */
+export const rejectRequest = async (
+  token: string,
+  requestCid: ContractId,
+  reason: string
+): Promise<any> => {
+  return fetchLedger(
+    '/exercise',
+    token,
+    {
+      templateId: TEMPLATE_IDS.AttestationRequest,
+      contractId: requestCid,
+      choice: 'Reject',
+      argument: {
+        reason,
+      },
+    }
+  );
+};
+
+/**
+ * For a KYC Provider to revoke an active attestation.
+ * @param token JWT of the provider party.
+ * @param attestationCid The ContractId of the Attestation to revoke.
+ */
+export const revokeAttestation = async (
+  token: string,
+  attestationCid: ContractId
+): Promise<any> => {
+  return fetchLedger(
+    '/exercise',
+    token,
+    {
+      templateId: TEMPLATE_IDS.Attestation,
+      contractId: attestationCid,
+      choice: 'Revoke',
+      argument: {},
+    }
+  );
+};
+
+/**
+ * For a customer to request an attestation from a provider.
+ * Assumes a CustomerRole contract exists between the customer and provider.
+ * @param token JWT of the customer party.
+ * @param customerRoleCid The ContractId of the customer's role contract with the provider.
+ * @param requestedAttributes List of attribute names to be verified.
+ * @param customerNote A note to the provider.
+ */
+export const requestAttestation = async (
+  token: string,
+  customerRoleCid: ContractId,
+  requestedAttributes: string[],
+  customerNote: string
+): Promise<any> => {
+  return fetchLedger(
+    '/exercise',
+    token,
+    {
+      templateId: TEMPLATE_IDS.CustomerRole,
+      contractId: customerRoleCid,
+      choice: 'RequestAttestation',
+      argument: {
+        requestedAttributes,
+        customerNote,
+      },
+    }
+  );
+};
+
+/**
+ * Allocates a new party on the ledger.
+ * This is an administrative function, often used for onboarding new users.
+ * @param adminToken JWT of a party with allocation rights.
+ * @param partyIdHint A desired identifier for the party.
+ * @param displayName A human-readable name for the party.
+ */
+export const allocateParty = async (
+  adminToken: string,
+  partyIdHint: string,
+  displayName: string
+): Promise<{ identifier: string }> => {
+  const url = `${API_BASE_V2}/parties/allocate`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        identifierHint: partyIdHint,
+        displayName: displayName,
+      }),
+    });
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Party allocation failed with status ${response.status}: ${errorText}`);
+    }
+    const jsonResponse = await response.json();
+    return jsonResponse.partyDetails;
+  } catch (error) {
+    console.error('Error during party allocation:', error);
+    throw error;
+  }
+};
+
+/**
+ * Creates a JWT for a given party ID.
+ * NOTE: This is an insecure method for development purposes ONLY.
+ * In production, a secure token vending service must be used.
+ * @param partyId The party ID to create a token for.
+ */
+export const createDevToken = (partyId: Party): string => {
+  const payload = {
+    "https://daml.com/ledger-api": {
+      "ledgerId": "dpm-sandbox", // Default for `dpm sandbox`
+      "participantId": "sandbox",
+      "applicationId": "kyc-app",
+      "actAs": [partyId],
+    },
+  };
+  const header = { "alg": "HS256", "typ": "JWT" };
+  const secret = "secret"; // Default for `dpm sandbox`
+  const encodedHeader = encode(JSON.stringify(header));
+  const encodedPayload = encode(JSON.stringify(payload));
+
+  // In a real app, the signing should be done with a proper crypto library.
+  // This is a simplified, non-secure HMAC-SHA256 simulation.
+  // We just return the unsigned parts for the sandbox which accepts it.
+  return `${encodedHeader}.${encodedPayload}.`;
+};
