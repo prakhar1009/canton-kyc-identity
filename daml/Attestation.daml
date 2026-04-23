@@ -1,80 +1,162 @@
--- | This module defines the core KYC Attestation template, which represents
--- a verifiable claim made by an identity provider about a subject party.
--- It includes features for expiry, revocation, and purpose-limitation via scopes.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module Attestation where
 
-import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, Implementation, View)
 import DA.Date
-import DA.Set (Set)
-import DA.Set qualified as Set
+import DA.Time
+import DA.Optional (isSome, fromSome)
+import Daml.Script
 
--- | Defines the level of Know-Your-Customer (KYC) verification.
--- These levels represent a simple hierarchy of assurance.
-data KycLevel
-  = Level1_IdentityConfirmed -- ^ Basic identity data confirmed (e.g., email, phone).
-  | Level2_DocumentVerified  -- ^ Government-issued document verified (e.g., passport, driver's license).
-  | VerifiedIndividual       -- ^ Full due diligence completed for a natural person.
-  | VerifiedInstitution      -- ^ Full due diligence completed for a legal entity.
-  deriving (Eq, Show, Ord, Read)
+-- | The specific type of verification an attestation represents. This allows for
+-- | a single identity framework to support multiple kinds of checks.
+data AttestationType
+  = AML_KYC -- Anti-Money Laundering / Know Your Customer
+  | ACCREDITED_INVESTOR -- Status as an accredited investor in a specific jurisdiction
+  | QUALIFIED_PURCHASER -- Status as a qualified purchaser in a specific jurisdiction
+  | PEP -- Politically Exposed Person check
+  deriving (Eq, Show, Ord)
 
--- | Represents a verifiable KYC attestation issued by an identity provider.
--- The attestation is privacy-preserving, as the subject controls its disclosure
--- to other parties. The `scope` field limits the context in which the
--- attestation is considered valid, preventing its use for unintended purposes.
---
--- For example, a scope of "trading:acme-corp" means the attestation is only
--- valid for trading with Acme Corp.
+-- | Represents a verifiable claim made by a KYC Provider about a Subject.
+-- This contract is the core of the identity system. It is created by a `provider`
+-- for a `subject`, and both must agree to its existence on the ledger.
 template Attestation
   with
-    provider     : Party
-      -- ^ The identity provider issuing the attestation.
-    subject      : Party
+    provider: Party
+      -- ^ The party issuing the attestation (e.g., a KYC service, a bank).
+    subject: Party
       -- ^ The party who is the subject of the attestation.
-    kycLevel     : KycLevel
-      -- ^ The level of KYC verification achieved.
-    expiryDate   : Date
-      -- ^ The date on which the attestation expires and is no longer valid.
-    id           : Text
-      -- ^ A unique identifier for this attestation, provided by the issuer.
-    scope        : Text
-      -- ^ The purpose for which this attestation can be used.
-      --   Example: "trading", "onboarding:acme-bank", "asset-tokenization".
-    observers    : Set Party
-      -- ^ The set of parties who can view this attestation.
+    attestationType: AttestationType
+      -- ^ The type of verification performed.
+    attestationId: Text
+      -- ^ A unique identifier for this attestation from the provider's off-ledger system.
+    issuedAt: Time
+      -- ^ The timestamp when the attestation was issued.
+    expiresAt: Optional Time
+      -- ^ The optional timestamp when the attestation expires. If `None`, it does not expire.
+    observers: [Party]
+      -- ^ A list of parties who are explicitly allowed to see this attestation.
   where
-    signatory provider
-    observer observers, subject
+    signatory provider, subject
+    observer observers
 
-    -- The key ensures that a provider cannot issue multiple attestations
-    -- for the same subject with the same external ID.
-    key (provider, subject, id) : (Party, Party, Text)
+    key (provider, subject, attestationType) : (Party, Party, AttestationType)
     maintainer key._1
 
     ensure
-      -- The subject must always be in the observer set to see their own attestations.
-      Set.member subject observers
+      -- The attestation must be issued before it expires.
+      case expiresAt of
+        Some expiry -> issuedAt < expiry
+        None -> True
 
-    -- Implementation of the standard Disclosure interface, allowing the subject
-    -- to selectively disclose their attestation to other parties.
-    interface instance Disclosure.I for Attestation where
-      view = Disclosure.View with disclosureControllers = Set.singleton subject
-      setObservers newObservers = self with observers = newObservers
-
-    -- | Allows the provider to revoke the attestation before its expiry date.
-    -- This is achieved by archiving the contract.
-    choice Revoke : ()
+    -- | Allows the provider to revoke the attestation. This action is permanent and
+    -- | creates a `RevokedAttestation` record as a tombstone, providing a clear
+    -- | audit trail that the attestation is no longer valid.
+    choice Revoke : ContractId RevokedAttestation
+      with
+        revokedAt: Time
+        reason: Text
       controller provider
       do
-        pure ()
+        ensure revokedAt >= issuedAt
+        create RevokedAttestation with
+          provider
+          subject
+          attestationType
+          attestationId
+          revokedAt
+          reason
 
-    -- | A non-consuming choice for an observer to verify the attestation is still active.
-    -- It checks that the provided date (presumably the current date) is before
-    -- or on the expiry date of the attestation. This allows relying parties
-    -- to confirm validity without needing further interaction from the provider.
-    nonconsuming choice CheckIsActive : ()
+    -- | Allows the subject to grant viewing permission to a new party. This is
+    -- | a key privacy-preserving feature, giving the subject granular control
+    -- | over who can see their attestation data.
+    choice AddObserver : ContractId Attestation
       with
-        currentDate : Date
-          -- ^ The current date to check against the expiry date.
-      controller observers
+        newObserver: Party
+      controller subject
       do
-        assertMsg ("Attestation expired on " <> show expiryDate) (currentDate <= expiryDate)
+        -- Ensure the new observer is not the provider or subject, and not already in the list.
+        assertMsg "Party is already a stakeholder or observer" (notElem newObserver (observers ++ [provider, subject]))
+        create this with observers = newObserver :: observers
+
+    -- | Allows the subject to revoke viewing permission from an existing observer.
+    choice RemoveObserver : ContractId Attestation
+      with
+        observerToRemove: Party
+      controller subject
+      do
+        assertMsg "Party is not an observer" (elem observerToRemove observers)
+        create this with observers = filter (\p -> p /= observerToRemove) observers
+
+-- | A record indicating that a previously issued `Attestation` has been revoked
+-- | by the provider. This serves as a persistent record of the revocation event,
+-- | visible to both the provider and the subject.
+template RevokedAttestation
+  with
+    provider: Party
+      -- ^ The party that issued and then revoked the attestation.
+    subject: Party
+      -- ^ The subject of the revoked attestation.
+    attestationType: AttestationType
+      -- ^ The type of the revoked attestation.
+    attestationId: Text
+      -- ^ The unique ID of the original attestation.
+    revokedAt: Time
+      -- ^ The timestamp of the revocation.
+    reason: Text
+      -- ^ The reason provided for the revocation.
+  where
+    signatory provider
+    observer subject
+
+    key (provider, subject, attestationType) : (Party, Party, AttestationType)
+    maintainer key._1
+
+-- | A convenience data type for checking the validity of an attestation.
+data AttestationStatus = IsValid | IsExpired | NotPresent
+  deriving (Eq, Show)
+
+-- | Helper function to check the status of a potential attestation.
+-- | It can be called from other contracts to verify a party's KYC status
+-- | without needing to be an observer on the attestation contract itself.
+-- | The caller must fetch the attestation first (e.g., via `fetchByKey`).
+checkAttestation : Time -> Optional Attestation -> AttestationStatus
+checkAttestation currentTime mbAttestation =
+  case mbAttestation of
+    None -> NotPresent
+    Some att ->
+      if isSome att.expiresAt && fromSome att.expiresAt < currentTime
+        then IsExpired
+        else IsValid
+
+-- | Example usage in a Daml Script for testing and demonstration purposes.
+setupPartiesAndAttestation : Script (ContractId Attestation)
+setupPartiesAndAttestation = script do
+  provider <- allocatePartyWithHint "KYCProvider" (PartyIdHint "kyc-provider")
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
+
+  now <- getTime
+
+  let att = Attestation with
+        provider = provider
+        subject = alice
+        attestationType = AML_KYC
+        attestationId = "kyc-alice-12345"
+        issuedAt = now
+        expiresAt = Some (addRelTime now (days 365))
+        observers = []
+
+  -- The provider proposes the attestation, and Alice must accept it.
+  -- Here we simplify by having the provider submit as both signatories.
+  -- In a real scenario, this would be a proposal/acceptance flow.
+  attestationCid <- submitMulti [provider, alice] [] do
+    createCmd att
+
+  -- Alice adds Bob as an observer so Bob can verify her status.
+  attestationCid' <- submit alice do
+    exerciseCmd attestationCid AddObserver with newObserver = bob
+
+  debug "Successfully created AML_KYC attestation for Alice, with Bob as an observer."
+
+  return attestationCid'
