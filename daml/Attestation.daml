@@ -1,162 +1,149 @@
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-module Attestation where
+module Kyc.Attestation where
 
-import DA.Date
-import DA.Time
-import DA.Optional (isSome, fromSome)
 import Daml.Script
+import DA.Date as D
+import DA.Optional (isSome)
 
--- | The specific type of verification an attestation represents. This allows for
--- | a single identity framework to support multiple kinds of checks.
-data AttestationType
-  = AML_KYC -- Anti-Money Laundering / Know Your Customer
-  | ACCREDITED_INVESTOR -- Status as an accredited investor in a specific jurisdiction
-  | QUALIFIED_PURCHASER -- Status as a qualified purchaser in a specific jurisdiction
-  | PEP -- Politically Exposed Person check
-  deriving (Eq, Show, Ord)
-
--- | Represents a verifiable claim made by a KYC Provider about a Subject.
--- This contract is the core of the identity system. It is created by a `provider`
--- for a `subject`, and both must agree to its existence on the ledger.
-template Attestation
+-- | A helper record to capture the essential details of an attestation for verification purposes.
+-- This prevents exposing the contract's choices or full implementation details to verification logic.
+data AttestationDetails = AttestationDetails
   with
     provider: Party
-      -- ^ The party issuing the attestation (e.g., a KYC service, a bank).
     subject: Party
-      -- ^ The party who is the subject of the attestation.
-    attestationType: AttestationType
-      -- ^ The type of verification performed.
-    attestationId: Text
-      -- ^ A unique identifier for this attestation from the provider's off-ledger system.
-    issuedAt: Time
-      -- ^ The timestamp when the attestation was issued.
-    expiresAt: Optional Time
-      -- ^ The optional timestamp when the attestation expires. If `None`, it does not expire.
-    observers: [Party]
-      -- ^ A list of parties who are explicitly allowed to see this attestation.
+    attestationType: Text
+    scope: Text
+    expiryDate: Optional Date
+  deriving (Eq, Show)
+
+-- | Checks if an attestation is valid as of a given date.
+-- An attestation is valid if it has not expired.
+isAttestationValid : Date -> Attestation -> Bool
+isAttestationValid currentDate attestation =
+  case attestation.expiryDate of
+    None -> True -- No expiry date means it's always valid.
+    Some d -> d >= currentDate
+
+-- | The core attestation template representing a single, verifiable claim made by an identity provider
+-- about a subject. This attestation is purpose-limited by its `scope`.
+template Attestation
+  with
+    provider   : Party
+      -- ^ The identity provider who issues the attestation.
+    subject    : Party
+      -- ^ The party whose identity is being attested.
+    attestationType : Text
+      -- ^ The type of claim being made (e.g., "IsNaturalPerson", "IsAccreditedInvestor").
+    scope      : Text
+      -- ^ A specific context or purpose for which this attestation is valid (e.g., "TradingPlatformX_Onboarding").
+    expiryDate : Optional Date
+      -- ^ The date on which this attestation expires. If `None`, it does not expire.
+    observers  : [Party]
+      -- ^ A list of parties who are allowed to view this attestation.
   where
     signatory provider, subject
     observer observers
 
-    key (provider, subject, attestationType) : (Party, Party, AttestationType)
+    key (provider, subject, attestationType, scope) : (Party, Party, Text, Text)
     maintainer key._1
 
-    ensure
-      -- The attestation must be issued before it expires.
-      case expiresAt of
-        Some expiry -> issuedAt < expiry
-        None -> True
-
-    -- | Allows the provider to revoke the attestation. This action is permanent and
-    -- | creates a `RevokedAttestation` record as a tombstone, providing a clear
-    -- | audit trail that the attestation is no longer valid.
-    choice Revoke : ContractId RevokedAttestation
-      with
-        revokedAt: Time
-        reason: Text
+    -- | Choice for the provider to revoke the attestation, effectively archiving it.
+    -- This is used when the attested claim is no longer valid before its expiry date.
+    choice Revoke : ()
       controller provider
       do
-        ensure revokedAt >= issuedAt
-        create RevokedAttestation with
-          provider
-          subject
-          attestationType
-          attestationId
-          revokedAt
-          reason
+        pure ()
 
-    -- | Allows the subject to grant viewing permission to a new party. This is
-    -- | a key privacy-preserving feature, giving the subject granular control
-    -- | over who can see their attestation data.
-    choice AddObserver : ContractId Attestation
+    -- | Choice for the subject to share this attestation with a new party, adding them as an observer.
+    -- This empowers the subject to control the dissemination of their own KYC data.
+    choice Share : ContractId Attestation
       with
-        newObserver: Party
+        newObserver : Party
       controller subject
       do
-        -- Ensure the new observer is not the provider or subject, and not already in the list.
-        assertMsg "Party is already a stakeholder or observer" (notElem newObserver (observers ++ [provider, subject]))
+        -- Ensure the new observer is not already a stakeholder to prevent redundancy.
+        assertMsg "New observer is already a stakeholder of this attestation" $
+          notElem newObserver (provider :: subject :: observers)
+
+        -- Create a new version of the attestation with the updated observer list.
+        -- The original contract is consumed in this process.
         create this with observers = newObserver :: observers
 
-    -- | Allows the subject to revoke viewing permission from an existing observer.
-    choice RemoveObserver : ContractId Attestation
-      with
-        observerToRemove: Party
-      controller subject
+    -- | Non-consuming choice for an existing observer to verify the details of the attestation.
+    -- This allows other contracts or off-ledger systems to check the validity of the claim
+    -- without altering the state of the attestation contract.
+    nonconsuming choice Verify : AttestationDetails
+      controller observers
       do
-        assertMsg "Party is not an observer" (elem observerToRemove observers)
-        create this with observers = filter (\p -> p /= observerToRemove) observers
+        return AttestationDetails with
+          provider = provider
+          subject = subject
+          attestationType = attestationType
+          scope = scope
+          expiryDate = expiryDate
 
--- | A record indicating that a previously issued `Attestation` has been revoked
--- | by the provider. This serves as a persistent record of the revocation event,
--- | visible to both the provider and the subject.
-template RevokedAttestation
-  with
-    provider: Party
-      -- ^ The party that issued and then revoked the attestation.
-    subject: Party
-      -- ^ The subject of the revoked attestation.
-    attestationType: AttestationType
-      -- ^ The type of the revoked attestation.
-    attestationId: Text
-      -- ^ The unique ID of the original attestation.
-    revokedAt: Time
-      -- ^ The timestamp of the revocation.
-    reason: Text
-      -- ^ The reason provided for the revocation.
-  where
-    signatory provider
-    observer subject
-
-    key (provider, subject, attestationType) : (Party, Party, AttestationType)
-    maintainer key._1
-
--- | A convenience data type for checking the validity of an attestation.
-data AttestationStatus = IsValid | IsExpired | NotPresent
-  deriving (Eq, Show)
-
--- | Helper function to check the status of a potential attestation.
--- | It can be called from other contracts to verify a party's KYC status
--- | without needing to be an observer on the attestation contract itself.
--- | The caller must fetch the attestation first (e.g., via `fetchByKey`).
-checkAttestation : Time -> Optional Attestation -> AttestationStatus
-checkAttestation currentTime mbAttestation =
-  case mbAttestation of
-    None -> NotPresent
-    Some att ->
-      if isSome att.expiresAt && fromSome att.expiresAt < currentTime
-        then IsExpired
-        else IsValid
-
--- | Example usage in a Daml Script for testing and demonstration purposes.
-setupPartiesAndAttestation : Script (ContractId Attestation)
-setupPartiesAndAttestation = script do
-  provider <- allocatePartyWithHint "KYCProvider" (PartyIdHint "kyc-provider")
+-- | Daml Script for setting up and testing the Attestation template lifecycle.
+setup : Script ()
+setup = script do
+  -- 1. Allocate parties
+  provider <- allocatePartyWithHint "IdentityProvider" (PartyIdHint "idp")
   alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
-  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
+  tradingPlatform <- allocatePartyWithHint "TradingPlatform" (PartyIdHint "tradingplatform")
 
+  -- 2. Get current time to set expiry date
   now <- getTime
+  let today = D.toDateUTC now
+  let expiry = D.addDays 365 today
 
-  let att = Attestation with
-        provider = provider
-        subject = alice
-        attestationType = AML_KYC
-        attestationId = "kyc-alice-12345"
-        issuedAt = now
-        expiresAt = Some (addRelTime now (days 365))
-        observers = []
+  -- 3. Provider issues an attestation to Alice for a specific scope.
+  -- Initially, only the provider and Alice can see it.
+  aliceAttestationCid <- submit provider do
+    createCmd Attestation with
+      provider = provider
+      subject = alice
+      attestationType = "IsAccreditedInvestor"
+      scope = "TradingPlatformX_Onboarding"
+      expiryDate = Some expiry
+      observers = []
 
-  -- The provider proposes the attestation, and Alice must accept it.
-  -- Here we simplify by having the provider submit as both signatories.
-  -- In a real scenario, this would be a proposal/acceptance flow.
-  attestationCid <- submitMulti [provider, alice] [] do
-    createCmd att
+  -- 4. Alice shares her attestation with the trading platform.
+  attestationSharedCid <- submit alice do
+    exerciseCmd aliceAttestationCid Share with newObserver = tradingPlatform
 
-  -- Alice adds Bob as an observer so Bob can verify her status.
-  attestationCid' <- submit alice do
-    exerciseCmd attestationCid AddObserver with newObserver = bob
+  -- 5. The trading platform verifies the attestation.
+  details <- submit tradingPlatform do
+    exerciseCmd attestationSharedCid (Verify)
 
-  debug "Successfully created AML_KYC attestation for Alice, with Bob as an observer."
+  debug $ "Trading Platform verified attestation: " <> show details
+  assert $ details.provider == provider
+  assert $ details.subject == alice
+  assert $ details.scope == "TradingPlatformX_Onboarding"
 
-  return attestationCid'
+  -- 6. Test the validity check helper function.
+  attestationContract <- queryContractId tradingPlatform attestationSharedCid
+  case attestationContract of
+    Some c -> do
+      let isValidNow = isAttestationValid today c
+      debug $ "Attestation is valid today: " <> show isValidNow
+      assert isValidNow
+
+      let futureDate = D.addDays 400 today
+      let isInvalidInFuture = not $ isAttestationValid futureDate c
+      debug $ "Attestation is invalid in 400 days: " <> show isInvalidInFuture
+      assert isInvalidInFuture
+    None ->
+      abort "Could not fetch shared attestation contract"
+
+  -- 7. Provider revokes the attestation.
+  submit provider do
+    exerciseCmd attestationSharedCid Revoke
+
+  -- 8. Verification by the platform should now fail as the contract is archived.
+  submitMustFail tradingPlatform do
+    exerciseCmd attestationSharedCid (Verify)
+
+  debug "Successfully tested Attestation lifecycle: Create, Share, Verify, and Revoke."
+
+  return ()
