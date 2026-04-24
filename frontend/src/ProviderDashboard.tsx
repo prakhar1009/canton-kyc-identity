@@ -1,175 +1,189 @@
-import React from 'react';
-import { useStreamQueries } from '@c7/react';
-import { DamlLedger } from '@c7/ledger';
-import { ContractId } from '@daml/types';
-import { Attestation, RevokedAttestation } from '../daml.js/canton-kyc-identity-0.1.0/lib/MultiAttestation';
-import { revokeAttestation } from './kycService';
+import React, { useState } from 'react';
+import { useParty, useLedger, useStreamQueries } from '@c7/react';
+import {
+  Container,
+  Typography,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Button,
+  Box,
+  CircularProgress,
+  Snackbar,
+  Alert,
+  Chip
+} from '@mui/material';
+import { Main } from '@daml.js/canton-kyc-identity-0.1.0';
 
-interface ProviderDashboardProps {
-  party: string;
-  ledger: DamlLedger;
-}
+/**
+ * Renders a dashboard for Identity Providers to manage their issued attestations.
+ * It displays lists of active and revoked attestations and allows the provider
+ * to revoke active ones.
+ */
+const ProviderDashboard: React.FC = () => {
+  const party = useParty();
+  const ledger = useLedger();
 
-const styles: { [key: string]: React.CSSProperties } = {
-  container: {
-    fontFamily: 'Arial, sans-serif',
-    padding: '20px',
-    maxWidth: '1200px',
-    margin: '0 auto',
-  },
-  header: {
-    fontSize: '2em',
-    color: '#333',
-    borderBottom: '2px solid #eee',
-    paddingBottom: '10px',
-    marginBottom: '20px',
-  },
-  section: {
-    marginBottom: '40px',
-  },
-  sectionHeader: {
-    fontSize: '1.5em',
-    color: '#555',
-    marginBottom: '15px',
-  },
-  table: {
-    width: '100%',
-    borderCollapse: 'collapse',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-  },
-  th: {
-    backgroundColor: '#f8f8f8',
-    border: '1px solid #ddd',
-    padding: '12px',
-    textAlign: 'left',
-    fontWeight: 'bold',
-  },
-  td: {
-    border: '1px solid #ddd',
-    padding: '12px',
-    verticalAlign: 'middle',
-  },
-  button: {
-    backgroundColor: '#d9534f',
-    color: 'white',
-    border: 'none',
-    padding: '8px 12px',
-    borderRadius: '4px',
-    cursor: 'pointer',
-    fontSize: '0.9em',
-  },
-  buttonHover: {
-    backgroundColor: '#c9302c',
-  },
-  noContracts: {
-    color: '#777',
-    fontStyle: 'italic',
-    padding: '20px',
-    backgroundColor: '#f9f9f9',
-    border: '1px solid #ddd',
-    borderRadius: '4px',
-  },
-  loading: {
-    fontSize: '1.2em',
-    color: '#555',
-  }
-};
+  // State for notification snackbar
+  const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: 'success' | 'error' } | null>(null);
 
-const ProviderDashboard: React.FC<ProviderDashboardProps> = ({ party, ledger }) => {
-  const { contracts: activeAttestations, loading: loadingActive } = useStreamQueries(Attestation, () => [{ provider: party }]);
-  const { contracts: revokedAttestations, loading: loadingRevoked } = useStreamQueries(RevokedAttestation, () => [{ provider: party }]);
+  // Stream active attestations issued by the current provider party
+  const { contracts: activeAttestations, loading: loadingActive } = useStreamQueries(
+    Main.MultiAttestation.Attestation,
+    () => [{ provider: party }],
+    [party]
+  );
 
-  const handleRevoke = async (attestationCid: ContractId<Attestation>) => {
-    if (window.confirm("Are you sure you want to revoke this attestation? This is a permanent action.")) {
-      try {
-        await revokeAttestation(ledger, attestationCid);
-        alert("Attestation successfully revoked.");
-      } catch (error) {
-        console.error("Failed to revoke attestation:", error);
-        alert(`Error: Could not revoke attestation. See console for details.`);
-      }
+  // Stream revoked attestations issued by the current provider party
+  const { contracts: revokedAttestations, loading: loadingRevoked } = useStreamQueries(
+    Main.MultiAttestation.RevokedAttestation,
+    () => [{ provider: party }],
+    [party]
+  );
+
+  /**
+   * Handles the revocation of an attestation by exercising the 'Revoke' choice.
+   * @param contractId The ContractId of the Attestation to revoke.
+   */
+  const handleRevoke = async (contractId: string) => {
+    try {
+      await ledger.exercise(Main.MultiAttestation.Attestation.Revoke, contractId, {});
+      setSnackbar({ open: true, message: 'Attestation revoked successfully.', severity: 'success' });
+    } catch (error) {
+      console.error("Error revoking attestation:", error);
+      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+      setSnackbar({ open: true, message: `Failed to revoke attestation: ${errorMessage}`, severity: 'error' });
     }
   };
 
-  if (loadingActive || loadingRevoked) {
-    return <div style={styles.loading}>Loading dashboard...</div>;
-  }
+  const handleCloseSnackbar = () => {
+    if (snackbar) {
+      setSnackbar({ ...snackbar, open: false });
+    }
+  };
+
+  /**
+   * Helper function to render a table of attestations.
+   * @param title The title for the table section.
+   * @param loading The loading state for this data set.
+   * @param contracts The list of contracts (active or revoked) to display.
+   * @param isRevokedTable A boolean flag to adjust columns for revoked attestations.
+   */
+  const renderAttestationTable = (
+    title: string,
+    loading: boolean,
+    contracts: readonly any[], // Can be Attestation or RevokedAttestation contracts
+    isRevokedTable: boolean = false
+  ) => (
+    <Box sx={{ mt: 4 }}>
+      <Typography variant="h5" component="h2" gutterBottom>
+        {title}
+      </Typography>
+      <TableContainer component={Paper}>
+        <Table sx={{ minWidth: 650 }} aria-label={`${title} table`}>
+          <TableHead>
+            <TableRow>
+              <TableCell>Subject Party</TableCell>
+              <TableCell>Attestation Type</TableCell>
+              <TableCell>Data Hash</TableCell>
+              {isRevokedTable ? (
+                <TableCell>Revocation Date</TableCell>
+              ) : (
+                <>
+                  <TableCell>Expiry Date</TableCell>
+                  <TableCell align="right">Actions</TableCell>
+                </>
+              )}
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {loading ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center">
+                  <CircularProgress />
+                </TableCell>
+              </TableRow>
+            ) : contracts.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center">
+                  No attestations to display.
+                </TableCell>
+              </TableRow>
+            ) : (
+              contracts.map((c) => (
+                <TableRow key={c.contractId}>
+                  <TableCell component="th" scope="row">
+                    {c.payload.subject}
+                  </TableCell>
+                  <TableCell><Chip label={c.payload.attestationType} color="primary" variant="outlined" /></TableCell>
+                  <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                    {c.payload.attestationDataHash}
+                  </TableCell>
+                  {isRevokedTable ? (
+                    <TableCell>{new Date(c.payload.revocationDate).toLocaleString()}</TableCell>
+                  ) : (
+                    <>
+                      <TableCell>{c.payload.expiryDate || 'N/A'}</TableCell>
+                      <TableCell align="right">
+                        <Button
+                          variant="contained"
+                          color="error"
+                          size="small"
+                          onClick={() => handleRevoke(c.contractId)}
+                        >
+                          Revoke
+                        </Button>
+                      </TableCell>
+                    </>
+                  )}
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    </Box>
+  );
 
   return (
-    <div style={styles.container}>
-      <h1 style={styles.header}>Provider Dashboard</h1>
+    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+      <Typography variant="h4" component="h1" gutterBottom>
+        Provider Dashboard
+      </Typography>
+      <Typography variant="subtitle1" color="text.secondary">
+        Managing attestations for: {party}
+      </Typography>
 
-      <div style={styles.section}>
-        <h2 style={styles.sectionHeader}>Active Attestations ({activeAttestations.length})</h2>
-        {activeAttestations.length > 0 ? (
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>Subject Party</th>
-                <th style={styles.th}>Attestation Type</th>
-                <th style={styles.th}>Data Hash</th>
-                <th style={styles.th}>Issue Date</th>
-                <th style={styles.th}>Expiry Date</th>
-                <th style={styles.th}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {activeAttestations.map(attestation => (
-                <tr key={attestation.contractId}>
-                  <td style={styles.td} title={attestation.payload.subject}>{`${attestation.payload.subject.substring(0, 12)}...`}</td>
-                  <td style={styles.td}>{attestation.payload.attestationType}</td>
-                  <td style={styles.td} title={attestation.payload.attestationDataHash}>{`${attestation.payload.attestationDataHash.substring(0, 12)}...`}</td>
-                  <td style={styles.td}>{attestation.payload.issueDate}</td>
-                  <td style={styles.td}>{attestation.payload.expiryDate || 'N/A'}</td>
-                  <td style={styles.td}>
-                    <button
-                      style={styles.button}
-                      onMouseOver={e => e.currentTarget.style.backgroundColor = styles.buttonHover.backgroundColor}
-                      onMouseOut={e => e.currentTarget.style.backgroundColor = styles.button.backgroundColor}
-                      onClick={() => handleRevoke(attestation.contractId)}
-                    >
-                      Revoke
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <div style={styles.noContracts}>No active attestations found.</div>
-        )}
-      </div>
+      {renderAttestationTable(
+        'Active Attestations',
+        loadingActive,
+        activeAttestations
+      )}
 
-      <div style={styles.section}>
-        <h2 style={styles.sectionHeader}>Revoked Attestations ({revokedAttestations.length})</h2>
-        {revokedAttestations.length > 0 ? (
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>Subject Party</th>
-                <th style={styles.th}>Attestation Type</th>
-                <th style={styles.th}>Data Hash</th>
-                <th style={styles.th}>Issue Date</th>
-                <th style={styles.th}>Revocation Date</th>
-              </tr>
-            </thead>
-            <tbody>
-              {revokedAttestations.map(attestation => (
-                <tr key={attestation.contractId}>
-                  <td style={styles.td} title={attestation.payload.subject}>{`${attestation.payload.subject.substring(0, 12)}...`}</td>
-                  <td style={styles.td}>{attestation.payload.attestationType}</td>
-                  <td style={styles.td} title={attestation.payload.attestationDataHash}>{`${attestation.payload.attestationDataHash.substring(0, 12)}...`}</td>
-                  <td style={styles.td}>{attestation.payload.issueDate}</td>
-                  <td style={styles.td}>{attestation.payload.revocationDate}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <div style={styles.noContracts}>No revoked attestations found.</div>
-        )}
-      </div>
-    </div>
+      {renderAttestationTable(
+        'Revoked Attestations',
+        loadingRevoked,
+        revokedAttestations,
+        true
+      )}
+
+      {snackbar && (
+        <Snackbar
+          open={snackbar.open}
+          autoHideDuration={6000}
+          onClose={handleCloseSnackbar}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        >
+          <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: '100%' }}>
+            {snackbar.message}
+          </Alert>
+        </Snackbar>
+      )}
+    </Container>
   );
 };
 
