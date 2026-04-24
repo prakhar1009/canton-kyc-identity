@@ -1,66 +1,59 @@
 # Privacy Model & GDPR Considerations
 
-This document outlines the privacy architecture of the Canton KYC Identity solution, explaining how it leverages the unique features of the Canton network and Daml smart contracts to protect personal data and align with regulations like GDPR.
+This document outlines the privacy model of the Canton KYC/Identity solution and discusses its alignment with data protection regulations like the General Data Protection Regulation (GDPR).
 
-## Core Principle: Privacy by Design
+## Core Principles: Privacy by Design
 
-Unlike traditional public blockchains that broadcast all transaction data to all nodes, the Canton network operates on a "privacy by design" principle. Data is segregated and distributed on a strict need-to-know basis.
+The solution is built on Canton, a distributed ledger platform that provides privacy and confidentiality by design. Unlike public blockchains where all data is replicated to all nodes, Canton ensures that contract data is only distributed on a **strict need-to-know basis**.
 
-1.  **No Global Broadcast:** A Daml contract, which represents a piece of shared state (like a KYC attestation), is *only* known to the participants who are stakeholders on that contract.
-2.  **Explicit Stakeholders:** Daml forces developers to explicitly define who can see and act on data. The primary stakeholders are `signatories` (who must authorize creation/archival) and `observers` (who have read-only visibility).
-3.  **Sub-transaction Privacy:** When a choice is exercised on a contract, only the stakeholders of that contract and any contracts created or fetched within the transaction see the details. Other parties on the network remain unaware of the transaction's existence.
+1.  **Data Minimization:** A party on the network only sees the data from contracts where they are an explicit stakeholder (e.g., a signatory or observer). They have zero visibility into other transactions on the network.
+2.  **Sub-Transaction Privacy:** Within a single atomic transaction, Canton can enforce that different parties see different parts of the transaction. This is fundamental to our KYC model, where a Verifier can see a valid attestation without ever seeing the underlying Personal Identifiable Information (PII).
+3.  **Confidentiality:** All communication between participant nodes is encrypted, and the contract data itself is not visible to the network operators (validators) who provide sequencing and notarization services.
 
-In the context of this KYC solution, this means that the raw Personally Identifiable Information (PII) is never exposed to unintended parties.
+## Data Flow and Roles
 
-## The Attestation Model: Data Minimization in Practice
+Our model involves three primary roles, each with a distinct relationship to the user's data:
 
-The core of our privacy model is the separation of raw PII from the verifiable attestation.
+*   **Subject (The User):** The individual whose identity is being managed. They are the ultimate owner of their identity data and attestations.
+*   **Identity Provider (IP):** A trusted entity (e.g., a bank, government agency, or specialized KYC firm) that verifies the Subject's PII and issues corresponding on-ledger attestations.
+*   **Verifier (Relying Party):** An application or service that needs to confirm certain attributes of the Subject (e.g., "is over 18", "is a resident of Switzerland") to grant them access to a service.
 
-1.  **PII Data Contract:** When a user (`Subject`) onboards with an `IdentityProvider`, their PII (e.g., name, date of birth, document numbers) is encapsulated in a `PiiData` contract. The stakeholders of this contract are strictly limited to the `IdentityProvider` and the `Subject`. **No one else on the network can see this contract or its contents.**
+The privacy-preserving workflow is as follows:
 
-2.  **KYC Attestation Contract:** Upon successful verification, the `IdentityProvider` issues a `KycAttestation` contract. This contract acts as a verifiable credential or a "stamp of approval". It **does not contain the raw PII**. Instead, it contains metadata:
-    *   The issuer (`IdentityProvider`).
-    *   The owner (`Subject`).
-    *   The level of verification (e.g., "Level 1 - ID & Liveness Check").
-    *   An issue date and an expiry date.
-    *   A status (e.g., `Active`, `Revoked`, `Expired`).
+1.  **PII Collection (Off-Ledger):** The Subject provides their raw PII (name, date of birth, address, government ID) to an Identity Provider through a secure, off-ledger channel (e.g., a web portal).
+2.  **Attestation Issuance (On-Ledger):** After successfully verifying the PII, the IP creates an `Attestation` smart contract on the Canton ledger.
+    *   **Crucially, this `Attestation` contract DOES NOT contain raw PII.** Instead, it contains metadata: the issuer (IP), the owner (Subject), the type of attestation (e.g., `KYC_LEVEL_1`), an expiry date, and a unique reference identifier.
+    *   The Subject is a signatory on this contract, giving them control.
+3.  **Attestation Presentation (On-Ledger):** When a Verifier needs to check the Subject's status, the Subject explicitly exercises a choice on their `Attestation` contract to make the Verifier an `observer` on it. This is a granular, time-bound, and auditable act of consent.
+4.  **Verification:** The Verifier can now see the active `Attestation` contract. They can trust its validity because it was signed by a trusted IP. They confirm the Subject's status without ever seeing the underlying PII that the IP holds.
 
-## Privacy-Preserving Verification Flow
+## GDPR Compliance
 
-When a third-party service (e.g., a DeFi application, an exchange) needs to verify a user's KYC status, the flow is as follows:
+This architecture directly addresses several key articles of the GDPR.
 
-1.  The user (`Subject`) initiates an action with the service.
-2.  The service requests proof of KYC.
-3.  The user exercises a `Share` or `Disclose` choice on their `KycAttestation` contract, adding the service provider's party as an `observer`.
-4.  The service provider gains read-only access to the `KycAttestation` contract. They can verify:
-    *   That the attestation was issued by an `IdentityProvider` they trust.
-    *   That the `Subject` of the attestation matches the user they are interacting with.
-    *   That the attestation is currently `Active` and has not expired.
+#### **Article 17: Right to be Forgotten (Right to Erasure)**
 
-Crucially, the service provider **never** sees the underlying `PiiData` contract. They only see the *fact* of the attestation. This is a powerful implementation of the principle of data minimization.
+While distributed ledgers are inherently immutable, our model fully supports the Right to be Forgotten.
 
-## GDPR Compliance Considerations
+*   **Archiving Contracts:** The primary on-ledger data is the `Attestation` contract. This contract can be **archived** through a `Revoke` choice exercised by the IP or an `Expire` choice. Archiving removes the contract from the Active Contract Set (ACS), making it non-discoverable and unusable for future verifications. While the transaction history remains on the ledgers of the involved participants (IP and Subject), the data is no longer "active" or being processed.
+*   **Off-Ledger PII:** Since the sensitive raw PII is held in the Identity Provider's off-ledger systems, the Subject can request its deletion directly from the IP. Once the source PII is deleted, the on-ledger `Attestation` is effectively an orphaned, tokenized claim with no link back to the user's personal data.
 
-The Canton/Daml architecture aligns well with key GDPR principles.
+#### **Article 20: Right to Data Portability**
 
-#### Right to be Forgotten (Article 17)
+The Subject is a first-class participant on the Canton network. They are a direct stakeholder in all their `Attestation` contracts. This means they can directly query their participant node's ledger to retrieve a machine-readable record of all their active and archived attestations at any time, without needing an intermediary.
 
-While distributed ledgers are often associated with immutability, Daml's contract model provides a clear path for data removal from the *active state*.
+#### **Article 6 & 7: Lawfulness of Processing and Conditions for Consent**
 
-*   **Archival, Not Deletion:** A Daml contract can be archived. Archiving removes it from the Active Contract Set (ACS). For all practical purposes in the application's business logic, the data is gone.
-*   **Revocation:** If a user revokes consent or an `IdentityProvider` needs to invalidate an attestation, the `KycAttestation` contract is archived. This immediately prevents it from being used for future verifications.
-*   **Off-Ledger PII:** The `IdentityProvider` remains the primary Data Controller for the raw PII, which they typically store in their own secure, off-ledger systems. They are responsible for deleting this raw data upon a valid request from the user. The on-ledger system reflects this by archiving the associated contracts.
+Consent is managed explicitly and granularly through the Daml smart contract logic.
 
-#### Data Controller vs. Data Processor
+*   The Subject must actively accept the `Attestation` proposal from the IP to bring it into existence.
+*   The Subject must actively exercise a choice (e.g., `Present_To_Verifier`) to share their attestation with any third party. This action is atomic, auditable, and specific to a single Verifier for a specific purpose. There are no broad, standing allowances. The Subject can see exactly who they have shared their attestations with by querying their view of the ledger.
 
-*   **Data Controller:** The `IdentityProvider` who collects and verifies the PII is the Data Controller. They determine the purpose and means of processing personal data.
-*   **Data Subject:** The end-user who owns their identity and attestations is the Data Subject. They have control over who they share their attestations with.
-*   **Data Processor:** The Canton network participants (validators) can be considered Data Processors, as they process data on behalf of the stakeholders according to the rules defined in the Daml contracts. Due to Canton's privacy model, they process this data without being able to see its contents unless they are a stakeholder.
+#### **Data Controller vs. Data Processor**
 
-#### Data Minimization (Article 5)
+The roles under GDPR are clearly delineated:
 
-As described above, the entire system is architected around data minimization. Verifying parties receive the minimum information necessary (the attestation) to make a decision, without gaining access to the sensitive underlying PII.
-
-#### Data Portability (Article 20)
-
-The user (`Subject`) is a signatory on their own `KycAttestation` contract. They hold the "key" to this digital credential and can choose to present it to any service provider on the network, enabling seamless portability of their verified status across different applications.
+*   **Identity Provider:** Acts as the **Data Controller** for the raw PII it collects from Subjects.
+*   **Subject:** Acts as the **Data Controller** for their on-ledger `Attestation` contracts, managing who is permitted to view them.
+*   **Verifier:** Acts as a **Data Processor**, as they are consuming the `Attestation` for a specific, limited purpose based on the Subject's consent.
+*   **Network Operators:** Act as **Data Processors** on behalf of the participants. Due to Canton's encryption, they are processing encrypted data and have no access to its content, providing a strong basis for confidentiality.
